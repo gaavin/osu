@@ -131,6 +131,7 @@ namespace osu.Game.Configuration
             SetDefault(OsuSetting.RasterTearlineOffset, 0, -2000, 2000);
             SetDefault(OsuSetting.RasterRenderHeadroom, 0.5, 0, 5, 0.05);
             SetDefault(OsuSetting.RasterShowTearline, false);
+            SetDefault(OsuSetting.RasterAutoTearlineOffset, true);
 
             SetDefault(OsuSetting.ShowStoryboard, true);
             SetDefault(OsuSetting.BeatmapSkins, true);
@@ -496,5 +497,6 @@ namespace osu.Game.Configuration
         RasterTearlineOffset,
         RasterRenderHeadroom,
         RasterShowTearline,
+        RasterAutoTearlineOffset,
     }
 }

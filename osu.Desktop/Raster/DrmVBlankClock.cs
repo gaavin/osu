@@ -28,8 +28,9 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Blanking of one CRTC. Line <c>n</c> starts scanning out <c>n * PeriodNs / VTotal</c> after <c>VBlankNs</c>,
         /// the CLOCK_MONOTONIC time line 0 of the latest frame started scanning out, smoothed over recent vblanks.
+        /// <c>Display</c> names the mode, and is the same string for every vblank followed at it.
         /// </summary>
-        public sealed record Timing(int VDisplay, int VTotal, long PeriodNs, long VBlankNs);
+        public sealed record Timing(string Device, uint CrtcId, string Display, int VDisplay, int VTotal, long PeriodNs, long VBlankNs);
 
         private const int fit_window = 256;
 
@@ -225,6 +226,7 @@ namespace osu.Desktop.Raster
             var mode = crtc.Mode;
             long modePeriodNs = (long)mode.HTotal * mode.VTotal * 1_000_000 / mode.Clock;
             string description = $"{crtc.Device} CRTC {crtc.Id}, {mode.HDisplay}x{mode.VDisplay} at {crtc.RefreshRate:0.000} Hz, {mode.VTotal - mode.VDisplay} blanking lines";
+            string display = $"{mode.HDisplay}x{mode.VDisplay} at {crtc.RefreshRate:0.00} Hz with {mode.VTotal} lines";
 
             Logger.Log($"Raster sync following {description}");
 
@@ -323,7 +325,7 @@ namespace osu.Desktop.Raster
                             lastRejection = null;
                         }
 
-                        timing = new Timing(mode.VDisplay, mode.VTotal, (long)Math.Round(periodNs), (long)Math.Round(offsetNs + periodNs * sequence));
+                        timing = new Timing(crtc.Device, crtc.Id, display, mode.VDisplay, mode.VTotal, (long)Math.Round(periodNs), (long)Math.Round(offsetNs + periodNs * sequence));
                     }
                 }
 

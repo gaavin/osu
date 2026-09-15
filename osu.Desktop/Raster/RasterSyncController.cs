@@ -31,6 +31,11 @@ namespace osu.Desktop.Raster
         /// </summary>
         private const long spin_window_ns = 1_000_000;
 
+        /// <summary>
+        /// Presents between flips timed during a play, to keep the probe's polling to a fraction of a core.
+        /// </summary>
+        private const int probe_interval = 3;
+
         private const long status_interval_ns = 1_000_000_000;
 
         private readonly RasterSyncLinuxGameHost host;
@@ -38,13 +43,18 @@ namespace osu.Desktop.Raster
         private Bindable<RasterSyncMode> modeSetting = null!;
         private Bindable<int> slicesSetting = null!;
         private Bindable<int> offsetSetting = null!;
+        private Bindable<bool> autoOffsetSetting = null!;
         private Bindable<double> headroomSetting = null!;
         private IBindable<DisplayMode>? displayMode;
+
+        private TearlineOffsetFinder? finder;
 
         // Written on the update thread, read on the draw thread.
         private volatile RasterSyncMode mode;
         private volatile int slices = 1;
         private volatile int tearlineOffset;
+        private volatile bool autoOffset;
+        private volatile bool playing;
         private long headroomNs;
         private volatile DrmVBlankClock? clock;
         private volatile DrmVBlankClock.DisplayHint? displayHint;
@@ -56,12 +66,17 @@ namespace osu.Desktop.Raster
         private readonly long[] costs = new long[cost_history];
         private int nextCost;
         private bool planned;
+        private DrmVBlankClock.Timing? plannedTiming;
         private long plannedTarget;
         private long lastTarget;
         private long wakeTime;
         private long presentStart;
         private bool timerSlackSet;
         private string? blockedBy = "Off";
+
+        private FlipProbe? probe;
+        private bool probeArmed;
+        private int presentsSinceProbe;
 
         private long intervalStart;
         private int intervalPresents;
@@ -74,6 +89,12 @@ namespace osu.Desktop.Raster
 
         public string Status => status;
 
+        public string OffsetFinderStatus => finder?.Describe(clock?.Current) ?? @"Off";
+
+        public int? FoundTearlineOffset => clock?.Current is DrmVBlankClock.Timing timing ? finder?.GetSuggestion(timing)?.OffsetLines : null;
+
+        public void ForgetRecordedFlips() => finder?.Forget();
+
         public RasterSyncController(RasterSyncLinuxGameHost host)
         {
             this.host = host;
@@ -84,13 +105,17 @@ namespace osu.Desktop.Raster
         /// </summary>
         public void BindTo(OsuConfigManager config)
         {
+            finder = new TearlineOffsetFinder(host.Storage);
+
             slicesSetting = config.GetBindable<int>(OsuSetting.RasterFrameSlices);
             offsetSetting = config.GetBindable<int>(OsuSetting.RasterTearlineOffset);
+            autoOffsetSetting = config.GetBindable<bool>(OsuSetting.RasterAutoTearlineOffset);
             headroomSetting = config.GetBindable<double>(OsuSetting.RasterRenderHeadroom);
             modeSetting = config.GetBindable<RasterSyncMode>(OsuSetting.RasterSyncMode);
 
             slicesSetting.BindValueChanged(s => slices = s.NewValue, true);
             offsetSetting.BindValueChanged(o => tearlineOffset = o.NewValue, true);
+            autoOffsetSetting.BindValueChanged(a => autoOffset = a.NewValue, true);
             headroomSetting.BindValueChanged(h => Interlocked.Exchange(ref headroomNs, (long)(h.NewValue * 1_000_000)), true);
 
             if (host.Window != null)
@@ -115,6 +140,22 @@ namespace osu.Desktop.Raster
 
                 host.SetUnlimitedFrames(enabled);
             }, true);
+        }
+
+        /// <summary>
+        /// Records flips for the tear line offset finder while the user plays. Update thread.
+        /// </summary>
+        public void SetPlaying(bool isPlaying)
+        {
+            if (playing == isPlaying)
+                return;
+
+            playing = isPlaying;
+
+            if (isPlaying)
+                finder?.BeginPlay();
+            else
+                finder?.EndPlay();
         }
 
         /// <summary>
@@ -174,9 +215,14 @@ namespace osu.Desktop.Raster
             long slice = timing.PeriodNs / count;
             long cost = costs.Max() + Interlocked.Read(ref headroomNs);
 
+            // With the finder on, the manual offset trims the found one, covering the driver's delay after the flip the probe sees.
+            int offset = tearlineOffset;
+            if (autoOffset && finder?.GetSuggestion(timing) is TearlineOffsetFinder.Suggestion suggestion)
+                offset += suggestion.OffsetLines;
+
             // The first tear line of each refresh aims at the middle of the blanking interval, moved by the offset.
             // Further slices follow at even spacing down the screen.
-            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + tearlineOffset;
+            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + offset;
             long anchor = timing.VBlankNs + (long)(tearline * timing.PeriodNs / timing.VTotal);
 
             long now = Native.MonotonicNs();
@@ -186,6 +232,7 @@ namespace osu.Desktop.Raster
             if (target - lastTarget < slice / 2)
                 target += slice;
 
+            plannedTiming = timing;
             plannedTarget = target;
             planned = true;
 
@@ -205,6 +252,8 @@ namespace osu.Desktop.Raster
             nextCost = (nextCost + 1) % cost_history;
             intervalMaxCost = Math.Max(intervalMaxCost, cost);
 
+            armProbe();
+
             if (ready < plannedTarget)
             {
                 Native.WaitUntil(plannedTarget, spin_window_ns);
@@ -217,6 +266,31 @@ namespace osu.Desktop.Raster
                 presentStart = ready;
                 intervalLate++;
             }
+
+            if (probeArmed)
+                probe!.MarkSwap(presentStart);
+        }
+
+        private void armProbe()
+        {
+            probeArmed = false;
+
+            var timing = plannedTiming;
+
+            if (!playing || finder == null || timing == null || ++presentsSinceProbe < probe_interval)
+                return;
+
+            if (probe == null || probe.Device != timing.Device || probe.CrtcId != timing.CrtcId)
+            {
+                probe?.Dispose();
+                probe = new FlipProbe(timing.Device, timing.CrtcId, finder.AddFlip, finder.AddMiss);
+            }
+
+            // Armed before the wait for the scanline, so the probe is already polling when the frame is swapped.
+            probeArmed = probe.TryArm(timing.Display);
+
+            if (probeArmed)
+                presentsSinceProbe = 0;
         }
 
         /// <summary>
@@ -262,6 +336,12 @@ namespace osu.Desktop.Raster
 
         public void Dispose()
         {
+            probe?.Dispose();
+            probe = null;
+
+            // Exiting mid-play still keeps what was recorded.
+            finder?.EndPlay(waitForSave: true);
+
             clock?.Dispose();
             clock = null;
         }
