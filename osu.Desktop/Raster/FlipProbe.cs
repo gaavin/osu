@@ -30,8 +30,8 @@ namespace osu.Desktop.Raster
         public readonly uint CrtcId;
 
         private readonly int fd;
-        private readonly Action<string, long> onFlip;
-        private readonly Action<string> onMiss;
+        private readonly Action<DrmVBlankClock.Timing, long> onFlip;
+        private readonly Action<DrmVBlankClock.Timing> onMiss;
         private readonly SemaphoreSlim wake = new SemaphoreSlim(0);
 
         private volatile bool disposed;
@@ -39,14 +39,14 @@ namespace osu.Desktop.Raster
 
         // Handed from the draw thread to the probe thread through wake.
         private uint baselineFb;
-        private string display = string.Empty;
+        private DrmVBlankClock.Timing timing = null!;
         private long swapTime;
 
         /// <param name="device">The DRM primary node the CRTC belongs to.</param>
         /// <param name="crtcId">The CRTC showing the game.</param>
-        /// <param name="onFlip">Called on the probe thread with the display and the time from swap to flip, in nanoseconds.</param>
+        /// <param name="onFlip">Called on the probe thread with the timing the frame was presented against and the time from swap to flip, in nanoseconds.</param>
         /// <param name="onMiss">Called on the probe thread when no flip followed a swap.</param>
-        public FlipProbe(string device, uint crtcId, Action<string, long> onFlip, Action<string> onMiss)
+        public FlipProbe(string device, uint crtcId, Action<DrmVBlankClock.Timing, long> onFlip, Action<DrmVBlankClock.Timing> onMiss)
         {
             Device = device;
             CrtcId = crtcId;
@@ -69,7 +69,7 @@ namespace osu.Desktop.Raster
         /// Starts watching for the flip of a frame about to be swapped. Draw thread, before waiting for the frame's scanline.
         /// </summary>
         /// <returns>False if the previous flip is still being watched for.</returns>
-        public bool TryArm(string display)
+        public bool TryArm(DrmVBlankClock.Timing timing)
         {
             if (fd < 0 || disposed || Interlocked.CompareExchange(ref busy, 1, 0) != 0)
                 return false;
@@ -80,7 +80,7 @@ namespace osu.Desktop.Raster
                 return false;
             }
 
-            this.display = display;
+            this.timing = timing;
             Interlocked.Exchange(ref swapTime, 0);
             wake.Release();
             return true;
@@ -127,7 +127,7 @@ namespace osu.Desktop.Raster
                     // The flip happened between the last two reads. Unless the earlier one came after the swap,
                     // the probe was not running when it happened, and the time is unknown.
                     if (swap != 0 && previousRead >= swap)
-                        onFlip(display, (previousRead + now) / 2 - swap);
+                        onFlip(timing, (previousRead + now) / 2 - swap);
 
                     return;
                 }
@@ -135,7 +135,7 @@ namespace osu.Desktop.Raster
                 if (swap != 0 ? now - swap > timeout_ns : now - armed > swap_timeout_ns)
                 {
                     if (swap != 0)
-                        onMiss(display);
+                        onMiss(timing);
 
                     return;
                 }

@@ -36,14 +36,17 @@ namespace osu.Desktop.Raster
         /// </summary>
         private const int probe_interval = 3;
 
+        /// <summary>
+        /// Scanlines the tear line moves by per present while steering, so refits glide it rather than jump it.
+        /// </summary>
+        private const double max_steer_lines = 1;
+
         private const long status_interval_ns = 1_000_000_000;
 
         private readonly RasterSyncLinuxGameHost host;
 
         private Bindable<RasterSyncMode> modeSetting = null!;
         private Bindable<int> slicesSetting = null!;
-        private Bindable<int> offsetSetting = null!;
-        private Bindable<bool> autoOffsetSetting = null!;
         private Bindable<double> headroomSetting = null!;
         private IBindable<DisplayMode>? displayMode;
 
@@ -52,8 +55,6 @@ namespace osu.Desktop.Raster
         // Written on the update thread, read on the draw thread.
         private volatile RasterSyncMode mode;
         private volatile int slices = 1;
-        private volatile int tearlineOffset;
-        private volatile bool autoOffset;
         private volatile bool playing;
         private long headroomNs;
         private volatile DrmVBlankClock? clock;
@@ -69,6 +70,7 @@ namespace osu.Desktop.Raster
         private DrmVBlankClock.Timing? plannedTiming;
         private long plannedTarget;
         private long lastTarget;
+        private double? steeredOffset;
         private long wakeTime;
         private long presentStart;
         private bool timerSlackSet;
@@ -89,9 +91,7 @@ namespace osu.Desktop.Raster
 
         public string Status => status;
 
-        public string OffsetFinderStatus => finder?.Describe(clock?.Current) ?? @"Off";
-
-        public int? FoundTearlineOffset => clock?.Current is DrmVBlankClock.Timing timing ? finder?.GetSuggestion(timing)?.OffsetLines : null;
+        public string TearlineSteeringStatus => finder?.Describe(clock?.Current) ?? @"Off";
 
         public void ForgetRecordedFlips() => finder?.Forget();
 
@@ -108,14 +108,10 @@ namespace osu.Desktop.Raster
             finder = new TearlineOffsetFinder(host.Storage);
 
             slicesSetting = config.GetBindable<int>(OsuSetting.RasterFrameSlices);
-            offsetSetting = config.GetBindable<int>(OsuSetting.RasterTearlineOffset);
-            autoOffsetSetting = config.GetBindable<bool>(OsuSetting.RasterAutoTearlineOffset);
             headroomSetting = config.GetBindable<double>(OsuSetting.RasterRenderHeadroom);
             modeSetting = config.GetBindable<RasterSyncMode>(OsuSetting.RasterSyncMode);
 
             slicesSetting.BindValueChanged(s => slices = s.NewValue, true);
-            offsetSetting.BindValueChanged(o => tearlineOffset = o.NewValue, true);
-            autoOffsetSetting.BindValueChanged(a => autoOffset = a.NewValue, true);
             headroomSetting.BindValueChanged(h => Interlocked.Exchange(ref headroomNs, (long)(h.NewValue * 1_000_000)), true);
 
             if (host.Window != null)
@@ -144,7 +140,7 @@ namespace osu.Desktop.Raster
         }
 
         /// <summary>
-        /// Paces presents, and records flips for the tear line offset finder, only while the user plays.
+        /// Paces presents, and records flips to steer the tear line with, only while the user plays.
         /// Menus draw far more than a frame per refresh and gain nothing from waiting on scanout, so they are left to draw as they otherwise would.
         /// Update thread.
         /// </summary>
@@ -224,14 +220,9 @@ namespace osu.Desktop.Raster
             long slice = timing.PeriodNs / count;
             long cost = costs.Max() + Interlocked.Read(ref headroomNs);
 
-            // With the finder on, the manual offset trims the found one, covering the driver's delay after the flip the probe sees.
-            int offset = tearlineOffset;
-            if (autoOffset && finder?.GetSuggestion(timing) is TearlineOffsetFinder.Suggestion suggestion)
-                offset += suggestion.OffsetLines;
-
             // The first tear line of each refresh aims at the middle of the blanking interval, moved by the offset.
             // Further slices follow at even spacing down the screen.
-            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + offset;
+            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + steerOffset(timing);
             long anchor = timing.VBlankNs + (long)(tearline * timing.PeriodNs / timing.VTotal);
 
             long now = Native.MonotonicNs();
@@ -247,6 +238,25 @@ namespace osu.Desktop.Raster
 
             Native.SleepUntil(target - cost);
             wakeTime = Native.MonotonicNs();
+        }
+
+        /// <summary>
+        /// Moves the tear line towards the offset found from recorded flips, which the play in progress keeps refitting. Draw thread.
+        /// </summary>
+        private double steerOffset(DrmVBlankClock.Timing timing)
+        {
+            if (finder?.GetOffset(timing) is not int target)
+                return steeredOffset ?? 0;
+
+            // Further off than that, as when a play starts, the tear line shows either way, so it goes straight there.
+            double blankingLines = timing.VTotal - timing.VDisplay;
+
+            if (steeredOffset is not double current || Math.Abs(target - current) > blankingLines / 2)
+                steeredOffset = target;
+            else
+                steeredOffset = current + Math.Clamp(target - current, -max_steer_lines, max_steer_lines);
+
+            return steeredOffset.Value;
         }
 
         /// <summary>
@@ -296,7 +306,7 @@ namespace osu.Desktop.Raster
             }
 
             // Armed before the wait for the scanline, so the probe is already polling when the frame is swapped.
-            probeArmed = probe.TryArm(timing.Display);
+            probeArmed = probe.TryArm(timing);
 
             if (probeArmed)
                 presentsSinceProbe = 0;

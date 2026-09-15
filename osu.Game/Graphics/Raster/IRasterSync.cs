@@ -19,14 +19,9 @@ namespace osu.Game.Graphics.Raster
         string Status { get; }
 
         /// <summary>
-        /// What the tear line offset finder has recorded, and the offset it found.
+        /// Where the tear line is being steered to, and from which recorded flips.
         /// </summary>
-        string OffsetFinderStatus { get; }
-
-        /// <summary>
-        /// The tear line offset found from flips recorded in previous plays at the current display mode, or null without any.
-        /// </summary>
-        int? FoundTearlineOffset { get; }
+        string TearlineSteeringStatus { get; }
 
         /// <summary>
         /// Discards the flips recorded in previous plays.
