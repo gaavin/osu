@@ -12,7 +12,7 @@ using osu.Game.Graphics.Raster;
 namespace osu.Desktop.Raster
 {
     /// <summary>
-    /// Times each present against the display's scanout, so tear lines land where they are wanted rather than wherever a frame happens to finish.
+    /// Times each present against the display's scanout during gameplay, so tear lines land where they are wanted rather than wherever a frame happens to finish.
     /// </summary>
     /// <remarks>
     /// This is Blur Busters' beam racing. With the swap interval at 0 and the compositor flipping asynchronously, a new frame takes over from
@@ -128,6 +128,7 @@ namespace osu.Desktop.Raster
             {
                 mode = m.NewValue;
 
+                // The clock keeps following vblanks in menus, so pacing starts on a settled fit when gameplay does.
                 bool enabled = mode != RasterSyncMode.Disabled;
 
                 if (enabled && clock == null)
@@ -138,12 +139,14 @@ namespace osu.Desktop.Raster
                     clock = null;
                 }
 
-                host.SetUnlimitedFrames(enabled);
+                updateFrameLimits();
             }, true);
         }
 
         /// <summary>
-        /// Records flips for the tear line offset finder while the user plays. Update thread.
+        /// Paces presents, and records flips for the tear line offset finder, only while the user plays.
+        /// Menus draw far more than a frame per refresh and gain nothing from waiting on scanout, so they are left to draw as they otherwise would.
+        /// Update thread.
         /// </summary>
         public void SetPlaying(bool isPlaying)
         {
@@ -156,7 +159,11 @@ namespace osu.Desktop.Raster
                 finder?.BeginPlay();
             else
                 finder?.EndPlay();
+
+            updateFrameLimits();
         }
+
+        private void updateFrameLimits() => host.SetUnlimitedFrames(mode != RasterSyncMode.Disabled && playing);
 
         /// <summary>
         /// Whether to time this frame's present. Draw thread.
@@ -167,7 +174,9 @@ namespace osu.Desktop.Raster
             var currentClock = clock;
 
             if (mode == RasterSyncMode.Disabled || currentClock == null)
-                blocker = "Off";
+                blocker = @"Off";
+            else if (!playing)
+                blocker = @"Waiting for gameplay";
             else if (blocker == null && currentClock.Current == null)
                 blocker = currentClock.Status;
 

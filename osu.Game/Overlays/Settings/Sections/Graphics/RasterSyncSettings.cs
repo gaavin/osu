@@ -41,7 +41,7 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 new SettingsItemV2(new FormEnumDropdown<RasterSyncMode>
                 {
                     Caption = @"Raster sync",
-                    HintText = @"Times each frame against the display's scanout. Needs fullscreen, the OpenGL renderer and a frame limiter other than VSync.",
+                    HintText = @"Times each frame against the display's scanout during gameplay. Menus draw as usual. Needs fullscreen, the OpenGL renderer and a frame limiter other than VSync.",
                     Current = mode,
                 })
                 {
