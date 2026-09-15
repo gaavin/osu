@@ -17,5 +17,20 @@ namespace osu.Game.Graphics.Raster
         /// What raster sync is currently doing, or why it is not.
         /// </summary>
         string Status { get; }
+
+        /// <summary>
+        /// What the tear line offset finder has recorded, and the offset it found.
+        /// </summary>
+        string OffsetFinderStatus { get; }
+
+        /// <summary>
+        /// The tear line offset found from flips recorded in previous plays at the current display mode, or null without any.
+        /// </summary>
+        int? FoundTearlineOffset { get; }
+
+        /// <summary>
+        /// Discards the flips recorded in previous plays.
+        /// </summary>
+        void ForgetRecordedFlips();
     }
 }

@@ -24,6 +24,7 @@ using osu.Game.IO;
 using osu.Game.Graphics.Raster;
 using osu.Game.IPC;
 using osu.Game.Performance;
+using osu.Game.Screens.Play;
 using osu.Game.Utils;
 
 namespace osu.Desktop
@@ -148,7 +149,11 @@ namespace osu.Desktop
         {
             base.LoadComplete();
 
-            (Host as RasterSyncLinuxGameHost)?.RasterSync.BindTo(LocalConfig);
+            if (Host is RasterSyncLinuxGameHost rasterSyncHost)
+            {
+                rasterSyncHost.RasterSync.BindTo(LocalConfig);
+                UserPlayingState.BindValueChanged(p => rasterSyncHost.RasterSync.SetPlaying(p.NewValue != LocalUserPlayingState.NotPlaying), true);
+            }
 
             LoadComponentAsync(new DiscordRichPresence(), Add);
 
