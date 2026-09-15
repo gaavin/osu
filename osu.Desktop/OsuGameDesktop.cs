@@ -8,6 +8,7 @@ using System.Runtime.Versioning;
 using Microsoft.Win32;
 using osu.Desktop.IPC;
 using osu.Desktop.Performance;
+using osu.Desktop.Raster;
 using osu.Desktop.Security;
 using osu.Framework.Platform;
 using osu.Game;
@@ -20,6 +21,7 @@ using osu.Desktop.Windows;
 using osu.Framework.Allocation;
 using osu.Game.Configuration;
 using osu.Game.IO;
+using osu.Game.Graphics.Raster;
 using osu.Game.IPC;
 using osu.Game.Performance;
 using osu.Game.Utils;
@@ -41,6 +43,16 @@ namespace osu.Desktop
         public OsuGameDesktop(string[]? args = null)
             : base(args)
         {
+        }
+
+        protected override IReadOnlyDependencyContainer CreateChildDependencies(IReadOnlyDependencyContainer parent)
+        {
+            var dependencies = new DependencyContainer(base.CreateChildDependencies(parent));
+
+            if (Host is RasterSyncLinuxGameHost rasterSyncHost)
+                dependencies.CacheAs<IRasterSync>(rasterSyncHost.RasterSync);
+
+            return dependencies;
         }
 
         public override StableStorage? GetStorageForStableInstall()
@@ -132,6 +144,8 @@ namespace osu.Desktop
         protected override void LoadComplete()
         {
             base.LoadComplete();
+
+            (Host as RasterSyncLinuxGameHost)?.RasterSync.BindTo(LocalConfig);
 
             LoadComponentAsync(new DiscordRichPresence(), Add);
 
