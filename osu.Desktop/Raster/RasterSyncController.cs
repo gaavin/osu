@@ -2,7 +2,6 @@
 // See the LICENCE file in the repository root for full licence text.
 
 using System;
-using System.Linq;
 using System.Threading;
 using osu.Framework.Bindables;
 using osu.Framework.Platform;
@@ -24,7 +23,17 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Presents whose render time counts towards the prediction for the next one.
         /// </summary>
-        private const int cost_history = 64;
+        private const int cost_history = 1024;
+
+        /// <summary>
+        /// The fraction of recent presents the render time prediction covers. Frames slower than that finish late and present straight away.
+        /// </summary>
+        private const double cost_percentile = 0.99;
+
+        /// <summary>
+        /// How long more frame slices have to keep fitting before refreshes are split into them, so tear lines don't hop between counts.
+        /// </summary>
+        private const long slice_raise_delay_ns = 2_000_000_000;
 
         /// <summary>
         /// How long before a present the draw thread stops sleeping and spins instead.
@@ -64,8 +73,16 @@ namespace osu.Desktop.Raster
         private volatile string status = "Off";
 
         // Draw thread only.
-        private readonly long[] costs = new long[cost_history];
-        private int nextCost;
+        private readonly DurationWindow renderCosts = new DurationWindow(cost_history);
+
+        /// <summary>
+        /// From starting one timed swap to planning the next present: the swap call, then the rest of the frame loop.
+        /// </summary>
+        private readonly DurationWindow betweenPresents = new DurationWindow(cost_history);
+
+        private bool betweenPending;
+        private int sliceCount = 1;
+        private long moreSlicesFitSince;
         private bool planned;
         private DrmVBlankClock.Timing? plannedTiming;
         private long plannedTarget;
@@ -86,6 +103,10 @@ namespace osu.Desktop.Raster
         private long intervalMaxCost;
         private long intervalMaxSwap;
         private long intervalMaxError;
+
+        // Counted on the probe thread, read and reset on the draw thread.
+        private int intervalFlips;
+        private int intervalOvertaken;
 
         public long PresentCount => Interlocked.Read(ref presentCount);
 
@@ -182,6 +203,7 @@ namespace osu.Desktop.Raster
                     status = blockedBy = blocker;
 
                 planned = false;
+                betweenPending = false;
                 return false;
             }
 
@@ -216,9 +238,15 @@ namespace osu.Desktop.Raster
                 return;
             }
 
-            int count = mode == RasterSyncMode.FrameSlices ? Math.Max(1, slices) : 1;
+            if (betweenPending)
+            {
+                betweenPresents.Add(Native.MonotonicNs() - presentStart);
+                betweenPending = false;
+            }
+
+            long cost = renderCosts.Percentile(cost_percentile) + Interlocked.Read(ref headroomNs);
+            int count = mode == RasterSyncMode.FrameSlices ? chooseSliceCount(timing, cost + betweenPresents.Percentile(cost_percentile)) : 1;
             long slice = timing.PeriodNs / count;
-            long cost = costs.Max() + Interlocked.Read(ref headroomNs);
 
             // The first tear line of each refresh aims at the middle of the blanking interval, moved by the offset.
             // Further slices follow at even spacing down the screen.
@@ -238,6 +266,35 @@ namespace osu.Desktop.Raster
 
             Native.SleepUntil(target - cost);
             wakeTime = Native.MonotonicNs();
+        }
+
+        /// <summary>
+        /// The number of slices to split refreshes into: as many as the setting allows that one present to the next still fits in.
+        /// With more, frames would miss slices and present two or three slices apart, so tear lines would move between refreshes and frames would age unevenly.
+        /// Draw thread.
+        /// </summary>
+        /// <param name="timing">The refresh being split.</param>
+        /// <param name="frameNs">How long one present to the next takes.</param>
+        private int chooseSliceCount(DrmVBlankClock.Timing timing, long frameNs)
+        {
+            int fits = (int)Math.Clamp(timing.PeriodNs / Math.Max(1, frameNs), 1, Math.Max(1, slices));
+
+            if (fits < sliceCount)
+            {
+                sliceCount = fits;
+                moreSlicesFitSince = 0;
+            }
+            else if (fits == sliceCount)
+                moreSlicesFitSince = 0;
+            else if (moreSlicesFitSince == 0)
+                moreSlicesFitSince = Native.MonotonicNs();
+            else if (Native.MonotonicNs() - moreSlicesFitSince >= slice_raise_delay_ns)
+            {
+                sliceCount = fits;
+                moreSlicesFitSince = 0;
+            }
+
+            return sliceCount;
         }
 
         /// <summary>
@@ -267,8 +324,7 @@ namespace osu.Desktop.Raster
             long ready = Native.MonotonicNs();
             long cost = ready - wakeTime;
 
-            costs[nextCost] = cost;
-            nextCost = (nextCost + 1) % cost_history;
+            renderCosts.Add(cost);
             intervalMaxCost = Math.Max(intervalMaxCost, cost);
 
             armProbe();
@@ -286,6 +342,8 @@ namespace osu.Desktop.Raster
                 intervalLate++;
             }
 
+            probe?.NoteSwap(presentStart);
+
             if (probeArmed)
                 probe!.MarkSwap(presentStart);
         }
@@ -302,7 +360,7 @@ namespace osu.Desktop.Raster
             if (probe == null || probe.Device != timing.Device || probe.CrtcId != timing.CrtcId)
             {
                 probe?.Dispose();
-                probe = new FlipProbe(timing.Device, timing.CrtcId, finder.AddFlip, finder.AddMiss);
+                probe = new FlipProbe(timing.Device, timing.CrtcId, onFlip, onOvertaken, finder.AddMiss);
             }
 
             // Armed before the wait for the scanline, so the probe is already polling when the frame is swapped.
@@ -310,6 +368,24 @@ namespace osu.Desktop.Raster
 
             if (probeArmed)
                 presentsSinceProbe = 0;
+        }
+
+        /// <summary>
+        /// Probe thread.
+        /// </summary>
+        private void onFlip(DrmVBlankClock.Timing timing, long latencyNs)
+        {
+            Interlocked.Increment(ref intervalFlips);
+            finder?.AddFlip(timing, latencyNs);
+        }
+
+        /// <summary>
+        /// Probe thread.
+        /// </summary>
+        private void onOvertaken(DrmVBlankClock.Timing timing)
+        {
+            Interlocked.Increment(ref intervalOvertaken);
+            finder?.AddOvertaken(timing);
         }
 
         /// <summary>
@@ -324,12 +400,20 @@ namespace osu.Desktop.Raster
 
             lastTarget = plannedTarget;
             planned = false;
+            betweenPending = true;
             Interlocked.Increment(ref presentCount);
 
             if (end - intervalStart >= status_interval_ns)
             {
-                status = $"{clock?.Status}. {intervalPresents * 1e9 / (end - intervalStart):0} presents/s, render up to {intervalMaxCost / 1e6:0.00} ms, "
-                         + $"{intervalLate} late, {intervalMaxError / 1e3:0} µs present timing error, swap call up to {intervalMaxSwap / 1e6:0.00} ms";
+                int flips = Interlocked.Exchange(ref intervalFlips, 0);
+                int overtaken = Interlocked.Exchange(ref intervalOvertaken, 0);
+
+                string slicesText = mode == RasterSyncMode.FrameSlices ? $"{sliceCount} of up to {slices} slices per refresh, " : string.Empty;
+                string overtakenText = flips + overtaken > 0 ? $", {overtaken} of {flips + overtaken} timed frames overtaken by the next before they flipped" : string.Empty;
+
+                status = $"{clock?.Status}. {intervalPresents * 1e9 / (end - intervalStart):0} presents/s, {slicesText}"
+                         + $"render {renderCosts.Percentile(cost_percentile) / 1e6:0.00} ms at the 99th percentile and up to {intervalMaxCost / 1e6:0.00} ms, "
+                         + $"{intervalLate} late, {intervalMaxError / 1e3:0} µs present timing error, swap call up to {intervalMaxSwap / 1e6:0.00} ms{overtakenText}";
 
                 startInterval(end);
             }
@@ -348,6 +432,8 @@ namespace osu.Desktop.Raster
             intervalMaxCost = 0;
             intervalMaxSwap = 0;
             intervalMaxError = 0;
+            Interlocked.Exchange(ref intervalFlips, 0);
+            Interlocked.Exchange(ref intervalOvertaken, 0);
         }
 
         private static long ceilingDivide(long dividend, long divisor) =>

@@ -45,6 +45,7 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 new SettingsItemV2(new FormSliderBar<int>
                 {
                     Caption = @"Frame slices per refresh",
+                    HintText = @"The most slices a refresh is split into. Fewer are used while frames take too long to fill every slice, so each slice still gets its own frame.",
                     Current = config.GetBindable<int>(OsuSetting.RasterFrameSlices),
                     KeyboardStep = 1,
                 })
@@ -54,7 +55,7 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 new SettingsItemV2(new FormSliderBar<double>
                 {
                     Caption = @"Render headroom",
-                    HintText = @"Time kept spare on top of the longest recent frame. Less is lower latency, until frames start finishing late and the tear line jumps.",
+                    HintText = @"Time kept spare on top of recent render times, leaving out the slowest 1% of frames. Less is lower latency, until frames start finishing late and the tear line jumps.",
                     Current = config.GetBindable<double>(OsuSetting.RasterRenderHeadroom),
                     KeyboardStep = 0.05f,
                     LabelFormat = v => $@"{v:0.00} ms",

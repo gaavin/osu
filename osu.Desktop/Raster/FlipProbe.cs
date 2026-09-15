@@ -13,6 +13,8 @@ namespace osu.Desktop.Raster
     /// The kernel swaps in the new plane state as soon as it accepts the compositor's commit, so the change marks the flip to within the
     /// driver's own programming delay. Reading the CRTC holds its modeset locks for a couple of microseconds, so the probe only polls from
     /// just before a swap until the flip that follows it.
+    /// Framebuffers don't say which swap they came from, so a flip that comes after the next frame was swapped can't be told apart from
+    /// that next frame replacing this one. Such frames are counted as overtaken rather than timed.
     /// </remarks>
     internal sealed unsafe class FlipProbe : IDisposable
     {
@@ -31,6 +33,7 @@ namespace osu.Desktop.Raster
 
         private readonly int fd;
         private readonly Action<DrmVBlankClock.Timing, long> onFlip;
+        private readonly Action<DrmVBlankClock.Timing> onOvertaken;
         private readonly Action<DrmVBlankClock.Timing> onMiss;
         private readonly SemaphoreSlim wake = new SemaphoreSlim(0);
 
@@ -42,15 +45,21 @@ namespace osu.Desktop.Raster
         private DrmVBlankClock.Timing timing = null!;
         private long swapTime;
 
+        // Written by the draw thread for every timed swap, watched or not.
+        private long latestSwapTime;
+
         /// <param name="device">The DRM primary node the CRTC belongs to.</param>
         /// <param name="crtcId">The CRTC showing the game.</param>
         /// <param name="onFlip">Called on the probe thread with the timing the frame was presented against and the time from swap to flip, in nanoseconds.</param>
+        /// <param name="onOvertaken">Called on the probe thread when the next frame was swapped before any flip followed a swap.</param>
         /// <param name="onMiss">Called on the probe thread when no flip followed a swap.</param>
-        public FlipProbe(string device, uint crtcId, Action<DrmVBlankClock.Timing, long> onFlip, Action<DrmVBlankClock.Timing> onMiss)
+        public FlipProbe(string device, uint crtcId, Action<DrmVBlankClock.Timing, long> onFlip, Action<DrmVBlankClock.Timing> onOvertaken,
+                         Action<DrmVBlankClock.Timing> onMiss)
         {
             Device = device;
             CrtcId = crtcId;
             this.onFlip = onFlip;
+            this.onOvertaken = onOvertaken;
             this.onMiss = onMiss;
 
             fd = Native.open(device, Native.O_RDWR | Native.O_CLOEXEC);
@@ -87,7 +96,12 @@ namespace osu.Desktop.Raster
         }
 
         /// <summary>
-        /// Draw thread, right before swapping the frame <see cref="TryArm"/> was called for.
+        /// Draw thread, right before swapping any timed frame, so a watched frame can be told when the next one overtakes it.
+        /// </summary>
+        public void NoteSwap(long ns) => Interlocked.Exchange(ref latestSwapTime, ns);
+
+        /// <summary>
+        /// Draw thread, right before swapping the frame <see cref="TryArm"/> was called for, and after <see cref="NoteSwap"/>.
         /// </summary>
         public void MarkSwap(long ns) => Interlocked.Exchange(ref swapTime, ns);
 
@@ -124,15 +138,30 @@ namespace osu.Desktop.Raster
 
                 if (fb != baselineFb)
                 {
-                    // The flip happened between the last two reads. Unless the earlier one came after the swap,
-                    // the probe was not running when it happened, and the time is unknown.
-                    if (swap != 0 && previousRead >= swap)
-                        onFlip(timing, (previousRead + now) / 2 - swap);
+                    if (swap == 0)
+                    {
+                        // An earlier frame flipped while this one waited for its scanline. This one's flip is still to come.
+                        baselineFb = fb;
+                    }
+                    else
+                    {
+                        // The flip happened between the last two reads. Unless the earlier one came after the swap,
+                        // the probe was not running when it happened, and the time is unknown.
+                        if (previousRead >= swap)
+                        {
+                            long flip = (previousRead + now) / 2;
+                            long latestSwap = Interlocked.Read(ref latestSwapTime);
 
-                    return;
+                            if (latestSwap > swap && latestSwap < flip)
+                                onOvertaken(timing);
+                            else
+                                onFlip(timing, flip - swap);
+                        }
+
+                        return;
+                    }
                 }
-
-                if (swap != 0 ? now - swap > timeout_ns : now - armed > swap_timeout_ns)
+                else if (swap != 0 ? now - swap > timeout_ns : now - armed > swap_timeout_ns)
                 {
                     if (swap != 0)
                         onMiss(timing);
