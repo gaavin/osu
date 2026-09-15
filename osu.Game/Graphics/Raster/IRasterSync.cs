@@ -1,0 +1,21 @@
+// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+// See the LICENCE file in the repository root for full licence text.
+
+namespace osu.Game.Graphics.Raster
+{
+    /// <summary>
+    /// Paces presented frames against the display's scanout. Provided by hosts that can see the display's vertical blanking.
+    /// </summary>
+    public interface IRasterSync
+    {
+        /// <summary>
+        /// The number of frames presented so far. Safe to read from the draw thread.
+        /// </summary>
+        long PresentCount { get; }
+
+        /// <summary>
+        /// What raster sync is currently doing, or why it is not.
+        /// </summary>
+        string Status { get; }
+    }
+}

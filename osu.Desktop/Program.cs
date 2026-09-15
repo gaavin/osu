@@ -5,6 +5,7 @@ using System;
 using System.IO;
 using System.Runtime.Versioning;
 using osu.Desktop.LegacyIpc;
+using osu.Desktop.Raster;
 using osu.Desktop.Windows;
 using osu.Framework;
 using osu.Framework.Development;
@@ -108,7 +109,7 @@ namespace osu.Desktop
                 FriendlyGameName = OsuGameBase.GAME_NAME,
             };
 
-            using (DesktopGameHost host = Host.GetSuitableDesktopHost(gameName, hostOptions))
+            using (DesktopGameHost host = OperatingSystem.IsLinux() ? new RasterSyncLinuxGameHost(gameName, hostOptions) : Host.GetSuitableDesktopHost(gameName, hostOptions))
             {
                 if (!host.IsPrimaryInstance)
                 {

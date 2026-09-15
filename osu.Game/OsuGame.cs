@@ -41,6 +41,7 @@ using osu.Game.Configuration;
 using osu.Game.Database;
 using osu.Game.Graphics;
 using osu.Game.Graphics.Containers;
+using osu.Game.Graphics.Raster;
 using osu.Game.Graphics.UserInterface;
 using osu.Game.Input;
 using osu.Game.Input.Bindings;
@@ -1168,6 +1169,8 @@ namespace osu.Game
                 Origin = Anchor.BottomRight,
                 Margin = new MarginPadding(5),
             }, topMostOverlayContent.Add);
+
+            loadComponentSingleFile(new TearlineIndicator(), topMostOverlayContent.Add);
 
             if (!IsDeployedBuild)
                 loadComponentSingleFile(devBuildBanner = new DevBuildBanner(), ScreenContainer.Add);

@@ -126,6 +126,12 @@ namespace osu.Game.Configuration
             // Graphics
             SetDefault(OsuSetting.ShowFpsDisplay, false);
 
+            SetDefault(OsuSetting.RasterSyncMode, RasterSyncMode.TearlineSync);
+            SetDefault(OsuSetting.RasterFrameSlices, 4, 2, 16);
+            SetDefault(OsuSetting.RasterTearlineOffset, 0, -2000, 2000);
+            SetDefault(OsuSetting.RasterRenderHeadroom, 0.5, 0, 5, 0.05);
+            SetDefault(OsuSetting.RasterShowTearline, false);
+
             SetDefault(OsuSetting.ShowStoryboard, true);
             SetDefault(OsuSetting.BeatmapSkins, true);
             SetDefault(OsuSetting.BeatmapColours, true);
@@ -485,5 +491,10 @@ namespace osu.Game.Configuration
         /// Blocks private messages, multiplayer room invites, and duel requests from people not on the user's friends list.
         /// </summary>
         PMFriendsOnly,
+        RasterSyncMode,
+        RasterFrameSlices,
+        RasterTearlineOffset,
+        RasterRenderHeadroom,
+        RasterShowTearline,
     }
 }
