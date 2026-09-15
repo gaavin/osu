@@ -14,9 +14,13 @@ using osuTK.Graphics;
 namespace osu.Game.Graphics.Raster
 {
     /// <summary>
-    /// A strip down the right edge of the screen that changes colour with every presented frame.
-    /// Wherever a tear line crosses it, the strip splits into two colours; with the tear line hidden in blanking, it flickers evenly.
+    /// A strip down the right edge of the screen that shows where frames take over from each other.
     /// </summary>
+    /// <remarks>
+    /// Frames timed for slices of a refresh are coloured by slice, so the strip holds still with any number of slices and a slice left without a frame
+    /// shows as a band two slices tall. Other frames flip the colour with every present: wherever a tear line crosses the strip, it splits into two colours,
+    /// and with the tear line hidden in blanking, it flickers evenly.
+    /// </remarks>
     public partial class TearlineIndicator : Drawable
     {
         private const float strip_width = 48;
@@ -82,7 +86,7 @@ namespace osu.Game.Graphics.Raster
             {
                 base.Draw(renderer);
 
-                long frame = rasterSync?.PresentCount ?? drawCount++;
+                long frame = rasterSync?.PlannedSlice ?? rasterSync?.PresentCount ?? drawCount++;
 
                 shader.Bind();
 
