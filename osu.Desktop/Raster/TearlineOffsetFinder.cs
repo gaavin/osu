@@ -14,12 +14,13 @@ using osu.Framework.Platform;
 namespace osu.Desktop.Raster
 {
     /// <summary>
-    /// Finds the tear line offset from how long the compositor took to flip frames during previous plays.
+    /// Finds the tear line offset from how long the compositor takes to flip frames, and keeps refitting it while the user plays.
     /// </summary>
     /// <remarks>
     /// A present timed for a scanline tears as far down the screen as scanout gets while the compositor flips it.
-    /// Each play's swap-to-flip times are kept as a histogram. The offset centres the blanking interval on the span of flip times,
-    /// as long as the blanking interval lasts, that holds the most flips across recent plays.
+    /// The offset centres the blanking interval on the span of flip times, as long as the blanking interval lasts, that holds the most flips.
+    /// During a play it is refitted every second or so to the play's recent flips, kept as a decaying histogram of swap-to-flip times.
+    /// Each finished play's histogram is kept too, so the next play starts from the offset found across recent plays.
     /// </remarks>
     internal sealed class TearlineOffsetFinder
     {
@@ -32,6 +33,21 @@ namespace osu.Desktop.Raster
 
         private const int plays_kept = 20;
         private const long min_play_flips = 200;
+
+        /// <summary>
+        /// Flips between refits during a play. About a second at 144 Hz, with the probe timing every third present.
+        /// </summary>
+        private const int steer_interval_flips = 48;
+
+        /// <summary>
+        /// Recent flips needed before a play steers the tear line from its own flips.
+        /// </summary>
+        private const double min_steer_flips = 96;
+
+        /// <summary>
+        /// How much of the recent histogram carries over each refit. Keeps about the last 240 flips.
+        /// </summary>
+        private const double steer_decay = 0.8;
 
         // Tearing flips follow the swap within a couple of milliseconds. A compositor holding frames for vblank takes most of a refresh.
         private const double max_median_latency_ms = 3;
@@ -60,6 +76,8 @@ namespace osu.Desktop.Raster
 
         private sealed record Cached(string Display, int VDisplay, int VTotal, int Version, Suggestion? Value);
 
+        private sealed record Steering(string Display, Suggestion Value);
+
         private readonly Storage storage;
         private readonly object sync = new object();
         private readonly object saveSync = new object();
@@ -71,10 +89,16 @@ namespace osu.Desktop.Raster
 
         // The play being recorded, guarded by sync.
         private readonly long[] bins = new long[bin_count];
+        private readonly double[] recent = new double[bin_count];
         private long flips;
+        private double recentFlips;
+        private int flipsSinceSteer;
         private long misses;
         private string? display;
         private bool playing;
+
+        private volatile Steering? steering;
+        private volatile string? steeringRejection;
 
         public TearlineOffsetFinder(Storage storage)
         {
@@ -105,12 +129,18 @@ namespace osu.Desktop.Raster
                     return;
 
                 playing = false;
+                steering = null;
+                steeringRejection = null;
 
                 if (display == null || flips < min_play_flips)
                     return;
 
-                double median = percentileMs(0.5);
-                double spread = percentileMs(0.75) - percentileMs(0.25);
+                double[] histogram = new double[bin_count];
+                for (int i = 0; i < bin_count; i++)
+                    histogram[i] = (double)bins[i] / flips;
+
+                double median = percentileMs(histogram, 0.5);
+                double spread = percentileMs(histogram, 0.75) - percentileMs(histogram, 0.25);
 
                 if (median > max_median_latency_ms)
                 {
@@ -154,7 +184,7 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Probe thread.
         /// </summary>
-        public void AddFlip(string flipDisplay, long latencyNs)
+        public void AddFlip(DrmVBlankClock.Timing timing, long latencyNs)
         {
             lock (sync)
             {
@@ -162,34 +192,49 @@ namespace osu.Desktop.Raster
                     return;
 
                 // A play at another mode than it started in only counts from the change on.
-                if (flipDisplay != display)
-                    reset(flipDisplay);
+                if (timing.Display != display)
+                    reset(timing.Display);
 
                 long bin = latencyNs / bin_ns;
+
                 if (bin < bin_count)
+                {
                     bins[bin]++;
+                    recent[bin]++;
+                }
 
                 flips++;
+                recentFlips++;
+
+                if (++flipsSinceSteer >= steer_interval_flips)
+                {
+                    flipsSinceSteer = 0;
+                    steer(timing);
+                }
             }
         }
 
         /// <summary>
         /// Probe thread.
         /// </summary>
-        public void AddMiss(string flipDisplay)
+        public void AddMiss(DrmVBlankClock.Timing timing)
         {
             lock (sync)
             {
-                if (playing && flipDisplay == display)
+                if (playing && timing.Display == display)
                     misses++;
             }
         }
 
+        /// <summary>
+        /// Discards the recorded plays, and the flips of the play in progress.
+        /// </summary>
         public void Forget()
         {
             lock (sync)
             {
                 recording.Plays.Clear();
+                reset(display);
                 lastRejection = null;
                 Interlocked.Increment(ref version);
             }
@@ -198,9 +243,98 @@ namespace osu.Desktop.Raster
         }
 
         /// <summary>
-        /// The offset for a mode, or null if no play has been recorded at it. Cached, so cheap enough for the draw thread.
+        /// The offset to aim the tear line at: the one steered from the play in progress, else the one found from previous plays,
+        /// or null with neither at the timing's mode. Draw thread.
         /// </summary>
-        public Suggestion? GetSuggestion(DrmVBlankClock.Timing timing)
+        public int? GetOffset(DrmVBlankClock.Timing timing)
+        {
+            var current = steering;
+
+            if (current != null && current.Display == timing.Display)
+                return current.Value.OffsetLines;
+
+            return fromPreviousPlays(timing)?.OffsetLines;
+        }
+
+        /// <summary>
+        /// Update thread.
+        /// </summary>
+        public string Describe(DrmVBlankClock.Timing? timing)
+        {
+            string text;
+
+            if (timing == null)
+                text = @"Waiting for the display.";
+            else if (steering is Steering current && current.Display == timing.Display)
+            {
+                text = $"Steering the tear line to {current.Value.OffsetLines} lines from this play's recent flips. "
+                       + $"The compositor takes {current.Value.MedianLatencyMs:0.00} ms to flip a frame (median), and {current.Value.Coverage:0%} of recent flips tear inside the blanking interval.";
+            }
+            else if (fromPreviousPlays(timing) is Suggestion suggestion)
+            {
+                text = $"Plays start at {suggestion.OffsetLines} lines, found from {suggestion.Flips} flips over {suggestion.Plays} plays, then steer from their own flips. "
+                       + $"The compositor takes {suggestion.MedianLatencyMs:0.00} ms to flip a frame (median), and {suggestion.Coverage:0%} of flips tear inside the blanking interval at this offset.";
+            }
+            else
+                text = $"No plays recorded at {timing.Display} yet. Plays steer the tear line once they have recorded a couple of seconds of flips.";
+
+            if (steeringRejection != null)
+                text += $" {steeringRejection}";
+
+            if (lastRejection != null)
+                text += $" {lastRejection}";
+
+            lock (sync)
+            {
+                if (playing)
+                    text += $" Recording this play: {flips} flips.";
+            }
+
+            return text;
+        }
+
+        /// <summary>
+        /// Refits the offset to the play's recent flips. Probe thread, holding sync.
+        /// </summary>
+        private void steer(DrmVBlankClock.Timing timing)
+        {
+            if (recentFlips < min_steer_flips)
+                return;
+
+            double[] histogram = new double[bin_count];
+
+            for (int i = 0; i < bin_count; i++)
+            {
+                histogram[i] = recent[i] / recentFlips;
+                recent[i] *= steer_decay;
+            }
+
+            recentFlips *= steer_decay;
+
+            double median = percentileMs(histogram, 0.5);
+            double spread = percentileMs(histogram, 0.75) - percentileMs(histogram, 0.25);
+
+            // The tear line holds where it is until flips look like tearing again.
+            if (median > max_median_latency_ms)
+            {
+                steeringRejection = $"Holding the tear line: recent frames took {median:0.00} ms to reach the display, so the compositor is holding them for vblank instead of tearing.";
+                return;
+            }
+
+            if (spread > max_latency_spread_ms)
+            {
+                steeringRejection = $"Holding the tear line: the compositor's recent flip times vary by {spread:0.00} ms.";
+                return;
+            }
+
+            steeringRejection = null;
+            steering = new Steering(timing.Display, fit(histogram, timing, 0, flips));
+        }
+
+        /// <summary>
+        /// The offset found from previous plays at a mode, or null if none has been recorded at it. Cached, so cheap enough for the draw thread.
+        /// </summary>
+        private Suggestion? fromPreviousPlays(DrmVBlankClock.Timing timing)
         {
             var current = cached;
 
@@ -214,35 +348,6 @@ namespace osu.Desktop.Raster
                 cached = new Cached(timing.Display, timing.VDisplay, timing.VTotal, version, value);
                 return value;
             }
-        }
-
-        /// <summary>
-        /// Update thread.
-        /// </summary>
-        public string Describe(DrmVBlankClock.Timing? timing)
-        {
-            string text;
-
-            if (timing == null)
-                text = @"Waiting for the display.";
-            else if (GetSuggestion(timing) is Suggestion suggestion)
-            {
-                text = $"Found offset: {suggestion.OffsetLines} lines, from {suggestion.Flips} flips over {suggestion.Plays} plays. "
-                       + $"The compositor takes {suggestion.MedianLatencyMs:0.00} ms to flip a frame (median), and {suggestion.Coverage:0%} of flips tear inside the blanking interval at this offset.";
-            }
-            else
-                text = $"No plays recorded at {timing.Display} yet. Play with raster sync active to record flips.";
-
-            if (lastRejection != null)
-                text += $" {lastRejection}";
-
-            lock (sync)
-            {
-                if (playing)
-                    text += $" Recording this play: {flips} flips.";
-            }
-
-            return text;
         }
 
         private Suggestion? compute(DrmVBlankClock.Timing timing)
@@ -264,16 +369,24 @@ namespace osu.Desktop.Raster
                 }
             }
 
+            return fit(combined, timing, plays.Count, plays.Sum(p => p.Flips));
+        }
+
+        /// <summary>
+        /// Fits the offset to a histogram holding the fraction of flips in each bin.
+        /// </summary>
+        private static Suggestion fit(double[] histogram, DrmVBlankClock.Timing timing, int plays, long totalFlips)
+        {
             double lineNs = (double)timing.PeriodNs / timing.VTotal;
             int width = Math.Clamp((int)((timing.VTotal - timing.VDisplay) * lineNs / bin_ns), 1, bin_count);
 
-            double sum = combined.Take(width).Sum();
+            double sum = histogram.Take(width).Sum();
             double best = sum;
             var bestStarts = new List<int> { 0 };
 
             for (int start = 1; start + width <= bin_count; start++)
             {
-                sum += combined[start + width - 1] - combined[start - 1];
+                sum += histogram[start + width - 1] - histogram[start - 1];
 
                 if (sum > best + 1e-9)
                 {
@@ -293,8 +406,8 @@ namespace osu.Desktop.Raster
 
             for (int i = bestStart; i < bestStart + width; i++)
             {
-                insideFlips += combined[i];
-                insideNs += combined[i] * (i + 0.5) * bin_ns;
+                insideFlips += histogram[i];
+                insideNs += histogram[i] * (i + 0.5) * bin_ns;
             }
 
             double centreNs = insideFlips > 0 ? insideNs / insideFlips : (bestStart + width / 2.0) * bin_ns;
@@ -303,35 +416,23 @@ namespace osu.Desktop.Raster
             double coverage = 0;
 
             for (int i = Math.Max(0, windowStart); i < Math.Min(bin_count, windowStart + width); i++)
-                coverage += combined[i];
+                coverage += histogram[i];
 
-            double medianNs = bin_count * bin_ns;
+            return new Suggestion(-(int)Math.Round(centreNs / lineNs), coverage, percentileMs(histogram, 0.5), plays, totalFlips);
+        }
+
+        /// <summary>
+        /// A percentile of a histogram holding the fraction of flips in each bin.
+        /// </summary>
+        private static double percentileMs(double[] histogram, double fraction)
+        {
             double seen = 0;
 
             for (int i = 0; i < bin_count; i++)
             {
-                seen += combined[i];
+                seen += histogram[i];
 
-                if (seen >= 0.5)
-                {
-                    medianNs = (i + 0.5) * bin_ns;
-                    break;
-                }
-            }
-
-            return new Suggestion(-(int)Math.Round(centreNs / lineNs), coverage, medianNs / 1e6, plays.Count, plays.Sum(p => p.Flips));
-        }
-
-        private double percentileMs(double fraction)
-        {
-            long target = (long)Math.Ceiling(flips * fraction);
-            long seen = 0;
-
-            for (int i = 0; i < bin_count; i++)
-            {
-                seen += bins[i];
-
-                if (seen >= target)
+                if (seen >= fraction - 1e-9)
                     return (i + 0.5) * bin_ns / 1e6;
             }
 
@@ -341,9 +442,14 @@ namespace osu.Desktop.Raster
         private void reset(string? newDisplay)
         {
             Array.Clear(bins);
+            Array.Clear(recent);
             flips = 0;
+            recentFlips = 0;
+            flipsSinceSteer = 0;
             misses = 0;
             display = newDisplay;
+            steering = null;
+            steeringRejection = null;
         }
 
         private Recording load()

@@ -19,22 +19,16 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
         private IRasterSync? rasterSync { get; set; }
 
         private readonly Bindable<SettingsNote.Data?> statusNote = new Bindable<SettingsNote.Data?>();
-        private readonly Bindable<SettingsNote.Data?> finderNote = new Bindable<SettingsNote.Data?>();
+        private readonly Bindable<SettingsNote.Data?> steeringNote = new Bindable<SettingsNote.Data?>();
         private readonly BindableBool slicesCanBeShown = new BindableBool();
 
-        private Bindable<int> offset = null!;
-        private Bindable<bool> autoOffset = null!;
-        private SettingsButtonV2 useFoundOffsetButton = null!;
-
         private string? lastStatus;
-        private string? lastFinderStatus;
+        private string? lastSteeringStatus;
 
         [BackgroundDependencyLoader]
         private void load(OsuConfigManager config)
         {
             var mode = config.GetBindable<RasterSyncMode>(OsuSetting.RasterSyncMode);
-            offset = config.GetBindable<int>(OsuSetting.RasterTearlineOffset);
-            autoOffset = config.GetBindable<bool>(OsuSetting.RasterAutoTearlineOffset);
 
             Children = new Drawable[]
             {
@@ -57,37 +51,6 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 {
                     CanBeShown = { BindTarget = slicesCanBeShown },
                 },
-                new SettingsItemV2(new FormCheckBox
-                {
-                    Caption = @"Find tear line offset from previous plays",
-                    HintText = @"During plays, times how long the compositor takes to flip frames, and aims the tear line so the most flips land in the blanking interval.",
-                    Current = autoOffset,
-                })
-                {
-                    Note = { BindTarget = finderNote },
-                    Keywords = new[] { @"calibrate", @"automatic" },
-                },
-                new SettingsItemV2(new FormSliderBar<int>
-                {
-                    Caption = @"Tear line offset",
-                    HintText = @"Scanlines to move the tear line by, on top of the found offset when that is on. Negative moves it up. "
-                               + @"To set it by eye, turn on the indicator, find where the tear line enters the bottom and the top of the screen, then settle halfway.",
-                    Current = offset,
-                    KeyboardStep = 1,
-                    LabelFormat = v => $@"{v} lines",
-                }),
-                useFoundOffsetButton = new SettingsButtonV2
-                {
-                    Text = @"Use the found offset as the manual offset",
-                    Action = () =>
-                    {
-                        if (rasterSync?.FoundTearlineOffset is not int found)
-                            return;
-
-                        offset.Value = found + (autoOffset.Value ? offset.Value : 0);
-                        autoOffset.Value = false;
-                    },
-                },
                 new SettingsItemV2(new FormSliderBar<double>
                 {
                     Caption = @"Render headroom",
@@ -99,8 +62,13 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 new SettingsItemV2(new FormCheckBox
                 {
                     Caption = @"Show tear line indicator",
+                    HintText = @"The tear line is steered into the blanking interval during plays, from how long the compositor takes to flip frames.",
                     Current = config.GetBindable<bool>(OsuSetting.RasterShowTearline),
-                }),
+                })
+                {
+                    Note = { BindTarget = steeringNote },
+                    Keywords = new[] { @"tear line offset", @"calibrate" },
+                },
                 new DangerousSettingsButtonV2
                 {
                     Text = @"Forget recorded flips",
@@ -122,7 +90,7 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
         private void updateStatus()
         {
             string status = rasterSync?.Status ?? @"Only available on Linux.";
-            string finderStatus = rasterSync?.OffsetFinderStatus ?? @"Only available on Linux.";
+            string steeringStatus = rasterSync?.TearlineSteeringStatus ?? @"Only available on Linux.";
 
             if (status != lastStatus)
             {
@@ -130,13 +98,11 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 statusNote.Value = new SettingsNote.Data(status, SettingsNote.Type.Informational);
             }
 
-            if (finderStatus != lastFinderStatus)
+            if (steeringStatus != lastSteeringStatus)
             {
-                lastFinderStatus = finderStatus;
-                finderNote.Value = new SettingsNote.Data(finderStatus, SettingsNote.Type.Informational);
+                lastSteeringStatus = steeringStatus;
+                steeringNote.Value = new SettingsNote.Data(steeringStatus, SettingsNote.Type.Informational);
             }
-
-            useFoundOffsetButton.Enabled.Value = rasterSync?.FoundTearlineOffset != null;
         }
     }
 }
