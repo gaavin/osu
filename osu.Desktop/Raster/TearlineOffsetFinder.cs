@@ -64,6 +64,11 @@ namespace osu.Desktop.Raster
             public long Misses { get; set; }
 
             /// <summary>
+            /// Timed frames the next frame was swapped after before they flipped, so the compositor may never have shown them. Not in <see cref="Flips"/>.
+            /// </summary>
+            public long Overtaken { get; set; }
+
+            /// <summary>
             /// Flips per 10 µs bin of swap-to-flip time. Flips past the last bin count towards <see cref="Flips"/> only.
             /// </summary>
             public Dictionary<int, long> Histogram { get; set; } = new Dictionary<int, long>();
@@ -94,6 +99,7 @@ namespace osu.Desktop.Raster
         private double recentFlips;
         private int flipsSinceSteer;
         private long misses;
+        private long overtaken;
         private string? display;
         private bool playing;
 
@@ -160,6 +166,7 @@ namespace osu.Desktop.Raster
                     Display = display,
                     Flips = flips,
                     Misses = misses,
+                    Overtaken = overtaken,
                 };
 
                 for (int i = 0; i < bin_count; i++)
@@ -227,6 +234,18 @@ namespace osu.Desktop.Raster
         }
 
         /// <summary>
+        /// Probe thread.
+        /// </summary>
+        public void AddOvertaken(DrmVBlankClock.Timing timing)
+        {
+            lock (sync)
+            {
+                if (playing && timing.Display == display)
+                    overtaken++;
+            }
+        }
+
+        /// <summary>
         /// Discards the recorded plays, and the flips of the play in progress.
         /// </summary>
         public void Forget()
@@ -287,7 +306,12 @@ namespace osu.Desktop.Raster
             lock (sync)
             {
                 if (playing)
+                {
                     text += $" Recording this play: {flips} flips.";
+
+                    if (overtaken > 0)
+                        text += $" {overtaken} timed frames were overtaken by the next frame before they flipped, so they may never have been shown.";
+                }
             }
 
             return text;
@@ -447,6 +471,7 @@ namespace osu.Desktop.Raster
             recentFlips = 0;
             flipsSinceSteer = 0;
             misses = 0;
+            overtaken = 0;
             display = newDisplay;
             steering = null;
             steeringRejection = null;
