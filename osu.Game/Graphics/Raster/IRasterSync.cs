@@ -14,6 +14,12 @@ namespace osu.Game.Graphics.Raster
         long PresentCount { get; }
 
         /// <summary>
+        /// Which slice of the refresh the frame being drawn is timed for, counting down from the top of the screen,
+        /// or null unless the frame is timed for one of several slices. Draw thread only.
+        /// </summary>
+        int? PlannedSlice { get; }
+
+        /// <summary>
         /// What raster sync is currently doing, or why it is not.
         /// </summary>
         string Status { get; }
