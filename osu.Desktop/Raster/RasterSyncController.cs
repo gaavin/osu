@@ -237,14 +237,36 @@ namespace osu.Desktop.Raster
         public readonly UpdateSync UpdateSync = new UpdateSync();
 
         /// <summary>
-        /// From starting a cursor draw held until the rest of the frame had finished on the GPU, to that draw finishing on the GPU too.
+        /// Whether a cursor drawn after the rest of the frame is waited on to finish on the GPU before the present. Off unless
+        /// <c>OSU_POINTER_LATCH_WAIT_GPU=1</c>: the cursor is a few quads, and the compositor waits for the GPU before flipping anyway.
+        /// </summary>
+        /// <remarks>
+        /// Measured in play with the wait, the held draw took 0.12 ms at p50 and 0.39 ms at p99. Planning every frame around that
+        /// dropped a slice, which aged the rest of the screen by 0.4 ms against the 0.33 ms it saved the cursor.
+        /// </remarks>
+        private static readonly bool late_draw_waits_for_gpu = Environment.GetEnvironmentVariable(@"OSU_POINTER_LATCH_WAIT_GPU") == @"1";
+
+        /// <summary>
+        /// From starting a cursor draw held until the rest of the frame had finished on the GPU, to it being submitted, or finished on the GPU if that is waited for.
         /// </summary>
         private readonly DurationWindow lateDraws = new DurationWindow(cost_history);
 
+#if RASTER_METRICS
         /// <summary>
-        /// Whether the last present drew a held cursor, so the next is planned with time for one.
+        /// The part of <see cref="lateDraws"/> spent drawing and submitting, before any wait for the GPU.
         /// </summary>
-        private bool lastPresentDrewLate;
+        private readonly DurationWindow lateDrawSubmits = new DurationWindow(cost_history);
+#endif
+
+        /// <summary>
+        /// Scanlines between the tear line given to the cursor and the top of the cursor, to cover the tear line landing off target,
+        /// and the pen moving up between planning the present and drawing the cursor. <c>OSU_CURSOR_TEARLINE_LEAD</c> sets it.
+        /// </summary>
+        private static readonly int cursor_tearline_lead = int.TryParse(Environment.GetEnvironmentVariable(@"OSU_CURSOR_TEARLINE_LEAD"), out int lead) && lead >= 0 ? lead : 32;
+
+        private bool plannedForCursor;
+        private long lastGridTarget;
+        private long lastCursorTarget;
 
 #if RASTER_METRICS
         // What the slice count was last decided on. Logged every second, since a count that keeps falling back is
@@ -343,6 +365,8 @@ namespace osu.Desktop.Raster
         private int intervalGen1;
         private int intervalGen2;
         private int intervalLateDraws;
+        private int intervalCursorPresents;
+        private int intervalCursorSkips;
         private long intervalMaxLateDraw;
 #endif
 
@@ -465,6 +489,11 @@ namespace osu.Desktop.Raster
         public bool HasPlannedPresent => planned;
 
         /// <summary>
+        /// Whether the planned present is the refresh's one tear line kept just above the cursor, rather than one of the evenly spaced slices. Draw thread.
+        /// </summary>
+        public bool PlannedForCursor => plannedForCursor;
+
+        /// <summary>
         /// Picks the scanline the next present should tear at, then sleeps until the frame has to start. Draw thread.
         /// </summary>
         public void PlanNextPresent()
@@ -504,9 +533,7 @@ namespace osu.Desktop.Raster
             // A collection that is due is paid for by this present: adding it to the cost aims the present at a later
             // slice, which leaves the gap before the frame starts drawing long enough to collect in.
             long reserved = gcPacer.Reserve();
-            // A cursor held until the frame has finished is drawn inside the wait for the scanline, so the frame starts that much earlier.
-            long lateNs = lastPresentDrewLate ? lateDraws.Percentile(costPercentile) : 0;
-            long cost = renderNs + lateNs + headroom + reserved;
+            long cost = renderNs + headroom + reserved;
 
             int previousCount = sliceCount;
             int count = 1;
@@ -515,8 +542,7 @@ namespace osu.Desktop.Raster
             {
                 // Frames that overrun a slice leave the next one without a frame of its own, which shows as uneven pacing rather than latency,
                 // so the count is decided on a stricter percentile than the margin a frame starts on.
-                long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + (lastPresentDrewLate ? lateDraws.Percentile(slice_fit_percentile) : 0)
-                                   + headroom + betweenPresents.Percentile(slice_fit_percentile);
+                long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + headroom + betweenPresents.Percentile(slice_fit_percentile);
 
                 count = chooseSliceCount(timing, slowFrameNs);
 
@@ -532,7 +558,8 @@ namespace osu.Desktop.Raster
 
             // The first tear line of each refresh aims at the middle of the blanking interval, moved by the offset.
             // Further slices follow at even spacing down the screen.
-            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + steerOffset(timing);
+            double offset = steerOffset(timing);
+            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + offset;
             long anchor = timing.VBlankNs + (long)(tearline * timing.PeriodNs / timing.VTotal);
 
             long now = Native.MonotonicNs();
@@ -542,13 +569,45 @@ namespace osu.Desktop.Raster
             if (target - lastTarget < slice / 2)
                 target += slice;
 
-            // Slices left without a frame of their own since the last present. A slice given up to hold a collection is
-            // counted apart from those, since skipped slices are how uneven pacing shows and this kind was asked for.
-            if (followsPresent && count == previousCount && target - lastTarget > slice * 3 / 2)
-            {
-                int missed = (int)((target - lastTarget + slice / 2) / slice) - 1;
+            bool forCursor = false;
 
-                if (reserved == 0)
+            // One more tear line each refresh sits just above the cursor, and its present draws the cursor last, so the cursor is scanned out
+            // right after the newest pen report is taken. The evenly spaced slices stay where they are, bar one the cursor's present crowds out.
+            if (mode == RasterSyncMode.FrameSlices && PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
+            {
+                long lateNs = lateDraws.Percentile(costPercentile);
+                double line = cursorTop - cursor_tearline_lead + offset;
+                long cursorBase = timing.VBlankNs + (long)(line * timing.PeriodNs / timing.VTotal);
+                long cursorTarget = cursorBase + ceilingDivide(now + cost + lateNs - cursorBase, timing.PeriodNs) * timing.PeriodNs;
+
+                // Once a refresh.
+                if (cursorTarget - lastCursorTarget < timing.PeriodNs / 2)
+                    cursorTarget += timing.PeriodNs;
+
+                // A slice presented first would have to leave time for another whole frame before the cursor's, or the cursor waits a refresh.
+                long afterSlice = target + betweenPresents.Percentile(costPercentile) + cost + lateNs;
+
+                if (cursorTarget < afterSlice)
+                {
+                    target = cursorTarget;
+                    cost += lateNs;
+                    forCursor = true;
+                }
+            }
+
+            // Slices left without a frame of their own since the last present. A slice given up to hold a collection, or crowded out by
+            // the cursor's present, is counted apart from those, since skipped slices are how uneven pacing shows and these were chosen.
+            if (!forCursor && followsPresent && count == previousCount && target - lastGridTarget > slice * 3 / 2)
+            {
+                int missed = (int)((target - lastGridTarget + slice / 2) / slice) - 1;
+
+                if (lastTarget == lastCursorTarget)
+                {
+#if RASTER_METRICS
+                    intervalCursorSkips += missed;
+#endif
+                }
+                else if (reserved == 0)
                     intervalSkipped += missed;
 #if RASTER_METRICS
                 else
@@ -556,9 +615,11 @@ namespace osu.Desktop.Raster
 #endif
             }
 
-            // Targets are whole slices from the anchor, whose slice is the one at the top of the screen.
-            long sliceNumber = (target - anchor) / slice;
+            // Targets are counted in slices from the anchor, whose slice is the one at the top of the screen. The cursor's present takes the
+            // number of the slice it tears inside, so the tear line indicator keeps that slice's colour.
+            long sliceNumber = (long)Math.Floor((double)(target - anchor) / slice);
             plannedSlice = count > 1 ? (int)((sliceNumber % count + count) % count) : null;
+            plannedForCursor = forCursor;
 
             plannedTiming = timing;
             plannedTarget = target;
@@ -770,9 +831,7 @@ namespace osu.Desktop.Raster
             long now = ready;
             var latch = host.PenLatch;
 
-            lastPresentDrewLate = latch?.HasDeferredDraw == true;
-
-            if (lastPresentDrewLate)
+            if (latch?.HasDeferredDraw == true)
             {
                 // The held cursor is drawn as close to the scanline as its own draw allows, so it takes the newest pen report there is.
                 long lateStart = plannedTarget - lateDraws.Percentile(costPercentile);
@@ -783,7 +842,13 @@ namespace osu.Desktop.Raster
                 long drawStart = Native.MonotonicNs();
 
                 latch!.DrawDeferred(host.Renderer);
-                host.FinishOnGpu();
+
+#if RASTER_METRICS
+                lateDrawSubmits.Add(Native.MonotonicNs() - drawStart);
+#endif
+
+                if (late_draw_waits_for_gpu)
+                    host.FinishOnGpu();
 
                 now = Native.MonotonicNs();
                 lateDraws.Add(now - drawStart);
@@ -886,6 +951,16 @@ namespace osu.Desktop.Raster
             intervalPresents++;
 
             lastTarget = plannedTarget;
+
+            if (plannedForCursor)
+            {
+                lastCursorTarget = plannedTarget;
+#if RASTER_METRICS
+                intervalCursorPresents++;
+#endif
+            }
+            else
+                lastGridTarget = plannedTarget;
             planned = false;
             betweenPending = true;
             Interlocked.Increment(ref presentCount);
@@ -949,7 +1024,9 @@ namespace osu.Desktop.Raster
                 if (host.PenLatch != null)
                 {
                     Logger.Log(host.PenLatch.TakeIntervalSummary()
-                               + $" {intervalLateDraws} were drawn after the rest of the frame finished, taking {ms(lateDraws.Percentile(0.5))}/{ms(lateDraws.Percentile(fixed_percentile))}/{ms(intervalMaxLateDraw)} ms at p50/p99/max.");
+                               + $" {intervalLateDraws} were drawn after the rest of the frame finished, taking {ms(lateDraws.Percentile(0.5))}/{ms(lateDraws.Percentile(fixed_percentile))}/{ms(intervalMaxLateDraw)} ms at p50/p99/max"
+                               + $" (drawing and submitting {ms(lateDrawSubmits.Percentile(0.5))}/{ms(lateDrawSubmits.Percentile(fixed_percentile))}, {(late_draw_waits_for_gpu ? "then waiting for the GPU" : "not waiting for the GPU")})."
+                               + $" {intervalCursorPresents} presents tore {cursor_tearline_lead} lines above the cursor, crowding out {intervalCursorSkips} slices.");
                 }
 #else
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
@@ -1050,6 +1127,8 @@ namespace osu.Desktop.Raster
             intervalGen1 = GC.CollectionCount(1);
             intervalGen2 = GC.CollectionCount(2);
             intervalLateDraws = 0;
+            intervalCursorPresents = 0;
+            intervalCursorSkips = 0;
             intervalMaxLateDraw = 0;
 #endif
             Interlocked.Exchange(ref intervalFlips, 0);

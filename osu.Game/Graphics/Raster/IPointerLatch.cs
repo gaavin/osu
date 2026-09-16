@@ -16,7 +16,9 @@ namespace osu.Game.Graphics.Raster
         /// Whether a cursor at this screen space position is following the pen, which is when it sits on one of the pen's recent reports.
         /// A cursor that follows a replay, a mouse or nothing at all is left where the update frame put it. Update thread.
         /// </summary>
-        bool IsFollowingPen(Vector2 screenSpacePosition);
+        /// <param name="screenSpacePosition">Where the update frame put the cursor.</param>
+        /// <param name="extentAbove">How far the cursor can reach above that position on screen, so a tear line can be kept clear of it.</param>
+        bool IsFollowingPen(Vector2 screenSpacePosition, float extentAbove);
 
         /// <summary>
         /// How far the pen has moved from a position <see cref="IsFollowingPen"/> accepted, in screen space, as of now. Draw thread.
