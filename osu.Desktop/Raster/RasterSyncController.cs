@@ -572,8 +572,9 @@ namespace osu.Desktop.Raster
             bool forCursor = false;
 
             // One more tear line each refresh sits just above the cursor, and its present draws the cursor last, so the cursor is scanned out
-            // right after the newest pen report is taken. The evenly spaced slices stay where they are, bar one the cursor's present crowds out.
-            if (mode == RasterSyncMode.FrameSlices && PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
+            // right after the newest pen report is taken. The evenly spaced slices stay where they are, bar any the cursor's present crowds out.
+            // With one tear line a refresh, in the blanking interval, that makes two presents a refresh, which is the fewest that keeps both.
+            if (PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
             {
                 long lateNs = lateDraws.Percentile(costPercentile);
                 double line = cursorTop - cursor_tearline_lead + offset;
