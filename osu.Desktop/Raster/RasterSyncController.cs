@@ -164,6 +164,11 @@ namespace osu.Desktop.Raster
         /// </summary>
         private readonly DurationWindow timingErrors = new DurationWindow(cost_history);
 
+        /// <summary>
+        /// What the runtime says each ephemeral collection cost, sampled once per collection rather than once per present.
+        /// </summary>
+        private readonly DurationWindow gcPauses = new DurationWindow(cost_history);
+
         private double costPercentile = cost_percentile_initial;
         private bool betweenPending;
         private int sliceCount = 1;
@@ -177,12 +182,15 @@ namespace osu.Desktop.Raster
         private double? steeredOffset;
         private long wakeTime;
         private long wakeCpuTime;
+        private int planCollections;
         private int wakeCollections;
         private int cpuSampleCounter;
         private bool samplingCpu;
         private long drawEnd;
         private long drawEndCpuTime;
         private int drawEndCollections;
+        private int readyCollections;
+        private int presentCollections;
         private long presentStart;
         private long swapEnd;
         private bool timerSlackSet;
@@ -198,6 +206,19 @@ namespace osu.Desktop.Raster
         private int intervalSkipped;
         private int intervalDrawsWithCollection;
         private long intervalMaxDrawWithCollection;
+
+        // Where in a present the runtime's collections land. Only the ones during the sleep are free.
+        private int intervalCollectionsIdle;
+        private int intervalCollectionsDrawing;
+        private int intervalCollectionsGpu;
+        private int intervalCollectionsWaiting;
+        private int intervalCollectionsSwapping;
+
+        private int lastCollections;
+        private long gcIndex;
+        private long gcAllocated;
+        private long intervalGcBytes;
+        private int intervalGcSamples;
         private long intervalMaxCost;
         private long intervalMaxDraw;
         private long intervalMaxFinish;
@@ -403,9 +424,15 @@ namespace osu.Desktop.Raster
             plannedWake = target - cost;
             planned = true;
 
+            // A collection that runs while the draw thread sleeps costs it nothing: the thread is inside a blocking
+            // call, so the runtime suspends it without waiting for it to reach a safe point. Counting those apart
+            // from the rest says how much of the collection load is already free, and how much is in the way.
+            planCollections = GC.CollectionCount(0);
+
             Native.SleepUntil(plannedWake);
             wakeTime = Native.MonotonicNs();
             wakeCollections = GC.CollectionCount(0);
+            intervalCollectionsIdle += wakeCollections - planCollections;
             drawEnd = 0;
 
             samplingCpu = ++cpuSampleCounter % cpu_sample_interval == 0;
@@ -525,6 +552,8 @@ namespace osu.Desktop.Raster
             long ready = Native.MonotonicNs();
             long cost = ready - wakeTime;
 
+            readyCollections = GC.CollectionCount(0);
+
             renderCosts.Add(cost);
             intervalMaxCost = Math.Max(intervalMaxCost, cost);
 
@@ -535,6 +564,9 @@ namespace osu.Desktop.Raster
 
                 draws.Add(draw);
                 gpuFinishes.Add(finish);
+
+                intervalCollectionsDrawing += drawEndCollections - wakeCollections;
+                intervalCollectionsGpu += readyCollections - drawEndCollections;
 
                 if (samplingCpu)
                     drawCpuTimes.Add(Math.Max(0, drawEndCpuTime - wakeCpuTime));
@@ -570,6 +602,9 @@ namespace osu.Desktop.Raster
                 presentStart = ready;
                 intervalLate++;
             }
+
+            presentCollections = GC.CollectionCount(0);
+            intervalCollectionsWaiting += presentCollections - readyCollections;
 
             probe?.NoteSwap(presentStart);
 
@@ -624,6 +659,11 @@ namespace osu.Desktop.Raster
         {
             long end = Native.MonotonicNs();
 
+            int endCollections = GC.CollectionCount(0);
+
+            intervalCollectionsSwapping += endCollections - presentCollections;
+            sampleCollectionPause(endCollections);
+
             swapCalls.Add(end - presentStart);
             intervalMaxSwap = Math.Max(intervalMaxSwap, end - presentStart);
             intervalPresents++;
@@ -670,6 +710,13 @@ namespace osu.Desktop.Raster
                            + $"swap to next plan {ms(betweenPresents.Percentile(0.5))}/{ms(betweenPresents.Percentile(fixed_percentile))}/{ms(intervalMaxBetween)}, "
                            + $"present timing error {ms(timingErrors.Percentile(0.5))}/{ms(timingErrors.Percentile(fixed_percentile))}/{ms(intervalMaxError)}");
 
+                int inPresent = intervalCollectionsDrawing + intervalCollectionsGpu + intervalCollectionsWaiting + intervalCollectionsSwapping;
+
+                Logger.Log($"Raster sync GC: {gen0}/{gen1}/{gen2} collections, {intervalCollectionsIdle} of them while the draw thread slept and {inPresent} in its way "
+                           + $"({intervalCollectionsDrawing} drawing, {intervalCollectionsGpu} waiting for the GPU, {intervalCollectionsWaiting} waiting for the scanline, "
+                           + $"{intervalCollectionsSwapping} swapping). Pause {ms(gcPauses.Percentile(0.5))}/{ms(gcPauses.Percentile(fixed_percentile))} ms at p50/p99, "
+                           + $"earned by {(intervalGcSamples > 0 ? intervalGcBytes / intervalGcSamples / 1024 : 0)} KiB allocated between collections.");
+
                 // Steered from a whole interval, so a single slow frame doesn't hold every later frame back.
                 if (intervalPresents >= cost_adjust_min_presents)
                     adjustCostPercentile(lateFraction);
@@ -683,6 +730,43 @@ namespace osu.Desktop.Raster
         /// </summary>
         public void CountPresent() => Interlocked.Increment(ref presentCount);
 
+        /// <summary>
+        /// Records what the runtime says the latest ephemeral collection cost, and how much was allocated to earn it. Draw thread.
+        /// </summary>
+        /// <remarks>
+        /// Reading the memory info costs 57 ns and allocates 288 bytes, which is not something every present should pay,
+        /// so it is only read once the collection count says one has actually happened: a dozen times a second rather than
+        /// several hundred. Several presents can follow one collection, so the index the runtime gives it tells repeats apart.
+        /// </remarks>
+        private void sampleCollectionPause(int collections)
+        {
+            if (collections == lastCollections)
+                return;
+
+            lastCollections = collections;
+
+            var info = GC.GetGCMemoryInfo(GCKind.Ephemeral);
+
+            if (info.Index == gcIndex)
+                return;
+
+            gcIndex = info.Index;
+
+            if (info.PauseDurations.Length > 0)
+                gcPauses.Add((long)info.PauseDurations[0].TotalNanoseconds);
+
+            // What the collection had to be earned by, which is the budget a scheduled collection would have to beat.
+            long allocated = GC.GetTotalAllocatedBytes();
+
+            if (gcAllocated > 0)
+            {
+                intervalGcBytes += allocated - gcAllocated;
+                intervalGcSamples++;
+            }
+
+            gcAllocated = allocated;
+        }
+
         private void startInterval(long now)
         {
             intervalStart = now;
@@ -691,6 +775,13 @@ namespace osu.Desktop.Raster
             intervalSkipped = 0;
             intervalDrawsWithCollection = 0;
             intervalMaxDrawWithCollection = 0;
+            intervalCollectionsIdle = 0;
+            intervalCollectionsDrawing = 0;
+            intervalCollectionsGpu = 0;
+            intervalCollectionsWaiting = 0;
+            intervalCollectionsSwapping = 0;
+            intervalGcBytes = 0;
+            intervalGcSamples = 0;
             intervalMaxCost = 0;
             intervalMaxDraw = 0;
             intervalMaxFinish = 0;
