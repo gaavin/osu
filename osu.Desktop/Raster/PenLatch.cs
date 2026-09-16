@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Threading;
 using OpenTabletDriver.Plugin.Output;
 using OpenTabletDriver.Plugin.Platform.Pointer;
+using osu.Framework.Bindables;
 using osu.Framework.Input.Handlers;
 using osu.Framework.Input.Handlers.Tablet;
 using osu.Framework.Logging;
@@ -44,8 +45,12 @@ namespace osu.Desktop.Raster
         /// </summary>
         private const float match_distance_squared = 0.25f;
 
+        private static readonly FieldInfo? output_mode_field = typeof(OpenTabletDriverHandler).GetField(@"outputMode", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        private readonly OpenTabletDriverHandler handler;
         private readonly IAbsolutePointer pointer;
         private readonly IPressureHandler pressure;
+        private readonly IBindable<TabletInfo?> tablet;
 
         // Written on the tablet's thread, read on the update and draw threads. A position packs into one long so it is read whole.
         private readonly long[] reports = new long[history];
@@ -75,10 +80,42 @@ namespace osu.Desktop.Raster
         private float intervalMaxOffset;
 #endif
 
-        private PenLatch(IAbsolutePointer pointer, IPressureHandler pressure)
+        private PenLatch(OpenTabletDriverHandler handler)
         {
-            this.pointer = pointer;
-            this.pressure = pressure;
+            this.handler = handler;
+            pointer = handler;
+            pressure = handler;
+
+            // The handler makes a new output mode each time a tablet is detected, which happens on OpenTabletDriver's own thread
+            // well after the handlers are initialised, and again whenever the tablet is reconnected. The tablet it reports is set
+            // just after, so that is when to stand in front of the new one.
+            tablet = handler.Tablet.GetBoundCopy();
+            tablet.BindValueChanged(t =>
+            {
+                if (t.NewValue != null)
+                    attach(t.NewValue);
+            }, true);
+        }
+
+        private void attach(TabletInfo info)
+        {
+            if (output_mode_field?.GetValue(handler) is not AbsoluteOutputMode outputMode)
+            {
+                Logger.Log($@"Pen latch: {info.Name} has no absolute output mode, so the cursor is drawn where update frames put it.");
+                return;
+            }
+
+            if (outputMode.Pointer == this)
+                return;
+
+            if (outputMode.Pointer != handler)
+            {
+                Logger.Log($@"Pen latch: {info.Name} reports to something other than the tablet handler, so the cursor is drawn where update frames put it.");
+                return;
+            }
+
+            outputMode.Pointer = this;
+            Logger.Log($@"Pen latch: following {info.Name}.");
         }
 
         /// <summary>
@@ -99,17 +136,13 @@ namespace osu.Desktop.Raster
             var pointerInterfaces = handler.GetType().GetInterfaces().Where(i => i.Namespace == typeof(IAbsolutePointer).Namespace).ToArray();
             var forwarded = new[] { typeof(IAbsolutePointer), typeof(IRelativePointer), typeof(IPressureHandler) };
 
-            if (pointerInterfaces.Except(forwarded).Any()
-                || typeof(OpenTabletDriverHandler).GetField(@"outputMode", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(handler) is not AbsoluteOutputMode outputMode
-                || outputMode.Pointer != handler)
+            if (pointerInterfaces.Except(forwarded).Any() || output_mode_field?.FieldType != typeof(AbsoluteOutputMode))
             {
                 Logger.Log(@"Pen latch: the tablet handler is not laid out as expected, so the cursor is drawn where update frames put it.");
                 return null;
             }
 
-            var latch = new PenLatch(handler, handler);
-            outputMode.Pointer = latch;
-            return latch;
+            return new PenLatch(handler);
         }
 
         void IAbsolutePointer.SetPosition(System.Numerics.Vector2 pos)
