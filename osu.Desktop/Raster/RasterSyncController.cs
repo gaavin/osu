@@ -603,10 +603,11 @@ namespace osu.Desktop.Raster
             bool forCursor = false;
             bool merged = false;
 
-            // One more tear line each refresh sits just above the cursor, and its present draws the cursor last, so the cursor is scanned out
-            // right after the newest pen report is taken. The evenly spaced slices stay where they are, bar any the cursor's present crowds out.
-            // With one tear line a refresh, in the blanking interval, that makes two presents a refresh, which is the fewest that keeps both.
-            if (PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
+            // Chasing the cursor, one more tear line each refresh sits just above it, and its present draws the cursor last, so the cursor is
+            // scanned out right after the newest pen report is taken. With the one tear line a refresh in the blanking interval, that makes two
+            // presents a refresh. It was tried alongside frame slices too, where the cursor's present crowded out 1.6 slices a refresh and play
+            // felt unevenly paced, so it has a mode of its own.
+            if (mode == RasterSyncMode.CursorChasing && PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
             {
                 long lateNs = lateDraws.Percentile(costPercentile);
                 double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
@@ -619,20 +620,17 @@ namespace osu.Desktop.Raster
                     line = blankingLine + Math.Floor((line - blankingLine) / band) * band;
                 }
 
-                if (count == 1)
-                {
-                    // The blanking interval's present is never given up. Measured in play, dropping it whenever the cursor was too close to it for both
-                    // left the top of the screen alternating between frames 1.75 ms apart, refresh to refresh. A cursor low on the screen has its tear
-                    // line pulled up far enough for a whole frame to fit before the blanking interval's, and one high on the screen, which that tear
-                    // line is only just above anyway, has its draw held on the blanking interval's present instead of a present of its own.
-                    double gapLines = (double)(betweenPresents.Percentile(costPercentile) + cost + lateNs) * timing.VTotal / timing.PeriodNs;
+                // The blanking interval's present is never given up. Measured in play, dropping it whenever the cursor was too close to it for both
+                // left the top of the screen alternating between frames 1.75 ms apart, refresh to refresh. A cursor low on the screen has its tear
+                // line pulled up far enough for a whole frame to fit before the blanking interval's, and one high on the screen, which that tear
+                // line is only just above anyway, has its draw held on the blanking interval's present instead of a present of its own.
+                double gapLines = (double)(betweenPresents.Percentile(costPercentile) + cost + lateNs) * timing.VTotal / timing.PeriodNs;
 
-                    line = Math.Min(line, blankingLine - gapLines);
-                    merged = line < blankingLine - timing.VTotal + gapLines;
+                line = Math.Min(line, blankingLine - gapLines);
+                merged = line < blankingLine - timing.VTotal + gapLines;
 
-                    if (merged)
-                        line = blankingLine - timing.VTotal;
-                }
+                if (merged)
+                    line = blankingLine - timing.VTotal;
 
                 plannedCursorLine = line;
 
@@ -656,11 +654,8 @@ namespace osu.Desktop.Raster
                     if (cursorTarget - lastCursorTarget < timing.PeriodNs / 2)
                         cursorTarget += timing.PeriodNs;
 
-                    // A slice presented first would have to leave time for another whole frame before the cursor's, or the cursor waits a refresh.
-                    // With one tear line a refresh the cursor's has already been placed to leave that time, so whichever comes first goes first.
-                    long afterSlice = count == 1 ? target : target + betweenPresents.Percentile(costPercentile) + cost + lateNs;
-
-                    if (cursorTarget < afterSlice)
+                    // The cursor's tear line has been placed to leave time for a whole frame either side of the blanking interval's, so whichever comes first goes first.
+                    if (cursorTarget < target)
                     {
                         target = cursorTarget;
                         cost += lateNs;
