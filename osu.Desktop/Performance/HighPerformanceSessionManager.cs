@@ -14,6 +14,31 @@ namespace osu.Desktop.Performance
     {
         public bool IsSessionActive => activeSessions > 0;
 
+        /// <summary>
+        /// The mode gameplay runs the collector in.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="GCLatencyMode.LowLatency"/> holds the gen0 budget at 256 KiB however large it is asked to be,
+        /// which buys a short pause at the price of collecting far more often. The other modes let gen0 grow to 16 MB,
+        /// which collects rarely but pauses for longer. Which of those a frame-paced game wants is a question of
+        /// measurement, so it can be set for a play without a rebuild.
+        /// </remarks>
+        private static readonly GCLatencyMode gameplay_gc_mode = readGameplayMode();
+
+        private static GCLatencyMode readGameplayMode()
+        {
+            string? requested = Environment.GetEnvironmentVariable(@"OSU_GAMEPLAY_GC_MODE");
+
+            // NoGCRegion cannot be entered by assigning it, and Batch turns off concurrency for the whole process.
+            if (!Enum.TryParse(requested, true, out GCLatencyMode mode)
+                || (mode != GCLatencyMode.Interactive && mode != GCLatencyMode.LowLatency && mode != GCLatencyMode.SustainedLowLatency))
+            {
+                return GCLatencyMode.LowLatency;
+            }
+
+            return mode;
+        }
+
         private int activeSessions;
 
         private GCLatencyMode originalGCMode;
@@ -32,10 +57,10 @@ namespace osu.Desktop.Performance
                 return;
             }
 
-            Logger.Log("Starting high performance session");
+            Logger.Log($"Starting high performance session (GC latency mode {gameplay_gc_mode})");
 
             originalGCMode = GCSettings.LatencyMode;
-            GCSettings.LatencyMode = GCLatencyMode.LowLatency;
+            GCSettings.LatencyMode = gameplay_gc_mode;
 
             // Without doing this, the new GC mode won't kick in until the next GC, which could be at a more noticeable point in time.
             GC.Collect(0);
@@ -51,7 +76,7 @@ namespace osu.Desktop.Performance
 
             Logger.Log("Ending high performance session");
 
-            if (GCSettings.LatencyMode == GCLatencyMode.LowLatency)
+            if (GCSettings.LatencyMode == gameplay_gc_mode)
                 GCSettings.LatencyMode = originalGCMode;
 
             // No GC.Collect() as we were already collecting at a higher frequency in the old mode.
