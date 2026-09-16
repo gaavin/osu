@@ -237,6 +237,13 @@ namespace osu.Desktop.Raster
         public readonly UpdateSync UpdateSync = new UpdateSync();
 
 #if RASTER_METRICS
+        /// <summary>
+        /// Draws the gameplay cursor at the newest pen report, if it was installed. Only measured from here.
+        /// </summary>
+        public PenLatch? PenLatch;
+#endif
+
+#if RASTER_METRICS
         // What the slice count was last decided on. Logged every second, since a count that keeps falling back is
         // otherwise only visible at the moment it changes.
         private long lastSlowFrameNs;
@@ -776,6 +783,7 @@ namespace osu.Desktop.Raster
             intervalCollectionsWaiting += presentCollections - readyCollections;
 
             UpdateSync.NotePresent(presentStart);
+            PenLatch?.NotePresent(presentStart);
 #endif
             probe?.NoteSwap(presentStart);
 
@@ -902,6 +910,9 @@ namespace osu.Desktop.Raster
                            + $"which costs a present {ms(gcPacer.ExpectedPauseNs)} ms against a {gcPacer.BudgetBytes / 1024} KiB budget.");
 
                 Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart));
+
+                if (PenLatch != null)
+                    Logger.Log(PenLatch.TakeIntervalSummary());
 #else
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
                          + $"frames start {ms(margin)} ms before their scanline, {intervalLate} late{overtakenText}";

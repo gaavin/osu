@@ -51,7 +51,13 @@ namespace osu.Desktop
             var dependencies = new DependencyContainer(base.CreateChildDependencies(parent));
 
             if (Host is RasterSyncLinuxGameHost rasterSyncHost)
+            {
                 dependencies.CacheAs<IRasterSync>(rasterSyncHost.RasterSync);
+
+                // The input handlers have been initialised by the time the game loads.
+                if (rasterSyncHost.InstallPenLatch() is PenLatch penLatch)
+                    dependencies.CacheAs<IPointerLatch>(penLatch);
+            }
 
             return dependencies;
         }

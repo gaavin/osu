@@ -8,10 +8,13 @@ using osu.Framework.Bindables;
 using osu.Framework.Extensions.Color4Extensions;
 using osu.Framework.Graphics;
 using osu.Framework.Graphics.Containers;
+using osu.Framework.Extensions.MatrixExtensions;
 using osu.Framework.Graphics.Effects;
+using osu.Framework.Graphics.Rendering;
 using osu.Framework.Graphics.Shapes;
 using osu.Game.Beatmaps;
 using osu.Game.Configuration;
+using osu.Game.Graphics.Raster;
 using osu.Game.Rulesets.Osu.Skinning;
 using osu.Game.Screens.Play;
 using osu.Game.Skinning;
@@ -59,6 +62,9 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
         [Resolved]
         private OsuConfigManager config { get; set; }
 
+        [Resolved(canBeNull: true)]
+        private IPointerLatch pointerLatch { get; set; }
+
         public OsuCursor()
         {
             Origin = Anchor.Centre;
@@ -86,6 +92,92 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
         {
             base.LoadComplete();
             cursorScale.Value = CalculateCursorScale();
+        }
+
+        protected override void Update()
+        {
+            base.Update();
+
+            // Whether the cursor is on the pen has to be checked every frame, not only the ones it moved in, or one frozen
+            // in place would be carried along by a pen it had already been on.
+            if (pointerLatch != null)
+                Invalidate(Invalidation.DrawNode);
+        }
+
+        protected override DrawNode CreateDrawNode() => new LatchedCursorDrawNode(this);
+
+        /// <summary>
+        /// Draws the cursor at the newest pen report as of the draw, when the update frame had it following the pen.
+        /// </summary>
+        private class LatchedCursorDrawNode : CompositeDrawableDrawNode
+        {
+            private IPointerLatch latch;
+            private Vector2 position;
+            private bool following;
+            private bool offsetTaken;
+            private Vector2 offset;
+
+            public LatchedCursorDrawNode(OsuCursor source)
+                : base(source)
+            {
+            }
+
+            public override void ApplyState()
+            {
+                base.ApplyState();
+
+                var cursor = (OsuCursor)Source;
+
+                latch = cursor.pointerLatch;
+                position = cursor.ToScreenSpace(cursor.OriginPosition);
+                following = latch?.IsFollowingPen(position) == true;
+                offsetTaken = false;
+            }
+
+            protected override void DrawOpaqueInterior(IRenderer renderer)
+            {
+                if (!pushOffset(renderer))
+                {
+                    base.DrawOpaqueInterior(renderer);
+                    return;
+                }
+
+                base.DrawOpaqueInterior(renderer);
+                renderer.PopLocalMatrix();
+            }
+
+            protected override void Draw(IRenderer renderer)
+            {
+                if (!pushOffset(renderer))
+                {
+                    base.Draw(renderer);
+                    return;
+                }
+
+                base.Draw(renderer);
+                renderer.PopLocalMatrix();
+            }
+
+            private bool pushOffset(IRenderer renderer)
+            {
+                if (!following)
+                    return false;
+
+                // Taken once per frame, so both passes put the cursor in the same place.
+                if (!offsetTaken)
+                {
+                    offset = latch.TakeOffset(position);
+                    offsetTaken = true;
+                }
+
+                if (offset == Vector2.Zero)
+                    return false;
+
+                Matrix3 translation = Matrix3.Identity;
+                MatrixExtensions.TranslateFromLeft(ref translation, offset);
+                renderer.PushLocalMatrix(translation);
+                return true;
+            }
         }
 
         protected virtual Drawable CreateCursorContent() => cursorScaleContainer = new Container
