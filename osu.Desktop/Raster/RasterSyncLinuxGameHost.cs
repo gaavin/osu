@@ -93,6 +93,11 @@ namespace osu.Desktop.Raster
         {
             base.UpdateFrame();
 
+#if !RASTER_METRICS
+            if (UpdateSync.MODE == UpdateSync.SyncMode.Off)
+                return;
+#endif
+
             // The scene is published by now. Waiting here rather than before the frame means the clock, which the update thread
             // processes after this returns, and the input collected in the next frame are both read once the wait is over.
             RasterSync.UpdateSync.FinishUpdateFrame(executionMode.Value != ExecutionMode.SingleThread);
@@ -150,7 +155,9 @@ namespace osu.Desktop.Raster
             // A fence covers this frame's commands alone, where glFinish waits for everything the context still has outstanding.
             IntPtr fence = GL.FenceSync(SyncCondition.SyncGpuCommandsComplete, WaitSyncFlags.None);
 
+#if RASTER_METRICS
             RasterSync.NoteDrawFinished();
+#endif
 
             GL.ClientWaitSync(fence, ClientWaitSyncFlags.SyncFlushCommandsBit, gpu_wait_timeout_ns);
             GL.DeleteSync(fence);

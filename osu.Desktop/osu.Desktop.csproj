@@ -19,6 +19,11 @@
     <CETCompat>false</CETCompat>
   </PropertyGroup>
 
+  <!-- Build with -p:RasterMetrics=true for the raster sync log lines and the measurements behind them, which gameplay does not need. -->
+  <PropertyGroup Condition="'$(RasterMetrics)'=='true'">
+    <DefineConstants>$(DefineConstants);RASTER_METRICS</DefineConstants>
+  </PropertyGroup>
+
   <PropertyGroup>
     <StartupObject>osu.Desktop.Program</StartupObject>
   </PropertyGroup>
