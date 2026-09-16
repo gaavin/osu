@@ -174,6 +174,11 @@ namespace osu.Desktop.Raster
         /// </summary>
         private readonly GcPacer gcPacer = new GcPacer();
 
+        // What the slice count was last decided on. Logged every second, since a count that keeps falling back is
+        // otherwise only visible at the moment it changes.
+        private long lastSlowFrameNs;
+        private int lastFits;
+
         private double costPercentile = cost_percentile_initial;
         private bool betweenPending;
         private int sliceCount = 1;
@@ -417,6 +422,7 @@ namespace osu.Desktop.Raster
                 // so the count is decided on a stricter percentile than the margin a frame starts on.
                 long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + headroom + betweenPresents.Percentile(slice_fit_percentile);
 
+                lastSlowFrameNs = slowFrameNs;
                 count = chooseSliceCount(timing, slowFrameNs);
 
                 if (count != previousCount)
@@ -498,6 +504,8 @@ namespace osu.Desktop.Raster
             frameNs = Math.Max(1, frameNs);
 
             int fits = (int)Math.Clamp(timing.PeriodNs / frameNs, 1, most);
+
+            lastFits = fits;
             int fitsWithRoom = (int)Math.Clamp((long)(timing.PeriodNs * slice_raise_fit) / frameNs, 1, most);
 
             if (fits < sliceCount)
@@ -733,7 +741,8 @@ namespace osu.Desktop.Raster
                 // The runtime log keeps what the status note shows, to line up with recordings of the screen afterwards.
                 Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late ({lateFraction:0.0%}, aiming for {late_target:0%}), "
                            + $"{overtaken} of {flips + overtaken} timed frames overtaken, GC {gen0}/{gen1}/{gen2}. "
-                           + $"Frames start {ms(margin)} ms before their scanline (render at the {costPercentile:0.0%} percentile, headroom {ms(Interlocked.Read(ref headroomNs))} ms).");
+                           + $"Frames start {ms(margin)} ms before their scanline (render at the {costPercentile:0.0%} percentile, headroom {ms(Interlocked.Read(ref headroomNs))} ms). "
+                           + $"All but the slowest {1 - slice_fit_percentile:0.0%} of frames need {ms(lastSlowFrameNs)} ms, which fits {lastFits} slices.");
 
                 Logger.Log($"Raster sync times, milliseconds at p50/p99/max: render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(fixed_percentile))}/{ms(intervalMaxCost)} "
                            + $"= draw {ms(draws.Percentile(0.5))}/{ms(draws.Percentile(fixed_percentile))}/{ms(intervalMaxDraw)} "
