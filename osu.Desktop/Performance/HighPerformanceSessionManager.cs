@@ -18,10 +18,12 @@ namespace osu.Desktop.Performance
         /// The mode gameplay runs the collector in.
         /// </summary>
         /// <remarks>
-        /// <see cref="GCLatencyMode.LowLatency"/> holds the gen0 budget at 256 KiB however large it is asked to be,
-        /// which buys a short pause at the price of collecting far more often. The other modes let gen0 grow to 16 MB,
-        /// which collects rarely but pauses for longer. Which of those a frame-paced game wants is a question of
-        /// measurement, so it can be set for a play without a rebuild.
+        /// <see cref="GCLatencyMode.LowLatency"/>, which gameplay used to ask for, holds the gen0 budget at 256 KiB
+        /// however large it is asked to be: measured in a play, 15.7 collections a second pausing 0.61 ms each.
+        /// Leaving the budget alone lets gen0 reach 16 MB and collect a fifth of a time a second instead, which measured
+        /// fourteen times less pause time, 0.19 ms off the margin a frame starts on, and a whole extra frame slice per
+        /// refresh, with nothing finishing late. The rare collection that remains is a long one, so this is still worth
+        /// being able to change for a play.
         /// </remarks>
         private static readonly GCLatencyMode gameplay_gc_mode = readGameplayMode();
 
@@ -33,7 +35,7 @@ namespace osu.Desktop.Performance
             if (!Enum.TryParse(requested, true, out GCLatencyMode mode)
                 || (mode != GCLatencyMode.Interactive && mode != GCLatencyMode.LowLatency && mode != GCLatencyMode.SustainedLowLatency))
             {
-                return GCLatencyMode.LowLatency;
+                return GCLatencyMode.Interactive;
             }
 
             return mode;
