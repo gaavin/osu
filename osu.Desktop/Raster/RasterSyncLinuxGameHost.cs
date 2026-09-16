@@ -133,6 +133,7 @@ namespace osu.Desktop.Raster
             }
 
             // The compositor waits for the GPU to finish a buffer before flipping it, so the wait for the scanline starts once it has.
+            RasterSync.NoteDrawFinished();
             GL.Finish();
 
             RasterSync.WaitForPlannedPresent();
