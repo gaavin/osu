@@ -48,6 +48,24 @@ namespace osu.Desktop.Raster
             return (IWindow)Activator.CreateInstance(typeof(LinuxGameHost).Assembly.GetType(windowType, true)!, preferredSurface, Options.FriendlyGameName, Options.BypassCompositor)!;
         }
 
+        /// <summary>
+        /// Puts the pen latch in front of the tablet handler, unless it is turned off or the handler is not laid out as expected. Once the input handlers are initialised.
+        /// </summary>
+        public PenLatch? InstallPenLatch()
+        {
+            if (PenLatch == null)
+            {
+                PenLatch = PenLatch.TryInstall(AvailableInputHandlers);
+#if RASTER_METRICS
+                RasterSync.PenLatch = PenLatch;
+#endif
+            }
+
+            return PenLatch;
+        }
+
+        public PenLatch? PenLatch { get; private set; }
+
         protected override ReadableKeyCombinationProvider CreateReadableKeyCombinationProvider() => new LinuxReadableKeyCombinationProvider();
 
         protected override IEnumerable<InputHandler> CreateAvailableInputHandlers()
