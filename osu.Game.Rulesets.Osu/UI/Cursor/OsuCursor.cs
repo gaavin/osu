@@ -107,15 +107,20 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
         protected override DrawNode CreateDrawNode() => new LatchedCursorDrawNode(this);
 
         /// <summary>
-        /// Draws the cursor at the newest pen report as of the draw, when the update frame had it following the pen.
+        /// Draws the cursor at the newest pen report, when the update frame had it following the pen. Where the frame is timed against
+        /// the display, the draw is held until the rest of the frame has finished on the GPU, and drawn on top of it just before it is presented.
         /// </summary>
-        private class LatchedCursorDrawNode : CompositeDrawableDrawNode
+        /// <remarks>
+        /// A held cursor is drawn over everything else in the frame, since the scene's depth is not kept for it.
+        /// </remarks>
+        private class LatchedCursorDrawNode : CompositeDrawableDrawNode, ILatchedDraw
         {
             private IPointerLatch latch;
             private Vector2 position;
             private bool following;
             private bool offsetTaken;
             private Vector2 offset;
+            private bool drawingLatched;
 
             public LatchedCursorDrawNode(OsuCursor source)
                 : base(source)
@@ -136,6 +141,10 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
 
             protected override void DrawOpaqueInterior(IRenderer renderer)
             {
+                // A held draw has no opaque interior in the scene, or it would be left behind where the update frame had the cursor.
+                if (following && latch.DefersDraws)
+                    return;
+
                 if (!pushOffset(renderer))
                 {
                     base.DrawOpaqueInterior(renderer);
@@ -148,6 +157,9 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
 
             protected override void Draw(IRenderer renderer)
             {
+                if (following && !drawingLatched && latch.TryDeferDraw(this))
+                    return;
+
                 if (!pushOffset(renderer))
                 {
                     base.Draw(renderer);
@@ -156,6 +168,18 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
 
                 base.Draw(renderer);
                 renderer.PopLocalMatrix();
+            }
+
+            public void DrawLatched(IRenderer renderer)
+            {
+                // Without depth, so it lands on top of the finished scene. Leaving depth also flushes the cursor's vertices.
+                renderer.PushDepthInfo(new DepthInfo(false, false));
+
+                drawingLatched = true;
+                DrawOther(this, renderer);
+                drawingLatched = false;
+
+                renderer.PopDepthInfo();
             }
 
             private bool pushOffset(IRenderer renderer)

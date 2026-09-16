@@ -9,6 +9,7 @@ using System.Threading;
 using OpenTabletDriver.Plugin.Output;
 using OpenTabletDriver.Plugin.Platform.Pointer;
 using osu.Framework.Bindables;
+using osu.Framework.Graphics.Rendering;
 using osu.Framework.Input.Handlers;
 using osu.Framework.Input.Handlers.Tablet;
 using osu.Framework.Logging;
@@ -36,6 +37,12 @@ namespace osu.Desktop.Raster
         public static readonly bool ENABLED = Environment.GetEnvironmentVariable(@"OSU_POINTER_LATCH") != @"0";
 
         /// <summary>
+        /// Whether a cursor in a frame timed against the display is drawn after the rest of the frame has finished on the GPU, rather than where the scene draws it.
+        /// <c>OSU_POINTER_LATCH=draw</c> keeps it in the scene, moved to the newest report as of the scene's draw.
+        /// </summary>
+        public static readonly bool LATE = Environment.GetEnvironmentVariable(@"OSU_POINTER_LATCH") != @"draw";
+
+        /// <summary>
         /// Recent reports a cursor can sit on to count as following the pen. Must be a power of two.
         /// </summary>
         private const int history = 16;
@@ -56,6 +63,10 @@ namespace osu.Desktop.Raster
         private readonly long[] reports = new long[history];
         private int nextReport;
         private long latest;
+
+        // Draw thread only.
+        private bool defersDraws;
+        private ILatchedDraw? deferred;
 
 #if RASTER_METRICS
         private const int metric_history = 1024;
@@ -209,6 +220,40 @@ namespace osu.Desktop.Raster
 #endif
 
             return offset;
+        }
+
+        public bool DefersDraws => defersDraws;
+
+        public bool TryDeferDraw(ILatchedDraw draw)
+        {
+            if (!defersDraws || deferred != null)
+                return false;
+
+            deferred = draw;
+            return true;
+        }
+
+        /// <summary>
+        /// Draw thread, before a frame is drawn: whether its present is timed, which is what gives a held draw somewhere to go.
+        /// </summary>
+        public void BeginFrame(bool timed)
+        {
+            defersDraws = timed && LATE;
+            deferred = null;
+        }
+
+        public bool HasDeferredDraw => deferred != null;
+
+        /// <summary>
+        /// Draws what was held, on top of the frame. Draw thread, once the rest of the frame has finished on the GPU.
+        /// </summary>
+        public void DrawDeferred(IRenderer renderer)
+        {
+            var draw = deferred;
+
+            deferred = null;
+            defersDraws = false;
+            draw?.DrawLatched(renderer);
         }
 
 #if RASTER_METRICS
