@@ -37,6 +37,11 @@ namespace osu.Desktop.Raster
         private const long slice_raise_delay_ns = 2_000_000_000;
 
         /// <summary>
+        /// How much of a slice a frame has to fit inside before more slices are used. A count that only just fits would be dropped again by the next slow frame.
+        /// </summary>
+        private const double slice_raise_fit = 0.9;
+
+        /// <summary>
         /// How long before a present the draw thread stops sleeping and spins instead.
         /// </summary>
         private const long spin_window_ns = 1_000_000;
@@ -90,6 +95,11 @@ namespace osu.Desktop.Raster
         /// From a timed swap returning to planning the next present.
         /// </summary>
         private readonly DurationWindow frameLoops = new DurationWindow(cost_history);
+
+        /// <summary>
+        /// How late presents that waited for their scanline started, which is how far their tear lines land past the one they were aimed at.
+        /// </summary>
+        private readonly DurationWindow timingErrors = new DurationWindow(cost_history);
 
         private bool betweenPending;
         private int sliceCount = 1;
@@ -317,26 +327,37 @@ namespace osu.Desktop.Raster
         /// With more, frames would miss slices and present two or three slices apart, so tear lines would move between refreshes and frames would age unevenly.
         /// Draw thread.
         /// </summary>
+        /// <remarks>
+        /// A count that stops fitting is dropped at once, since every frame past that point would miss a slice. Moving back up waits for the
+        /// higher count to fit with room to spare, and to keep fitting, so a frame time sitting near a slice boundary doesn't move the tear lines back and forth.
+        /// </remarks>
         /// <param name="timing">The refresh being split.</param>
         /// <param name="frameNs">How long one present to the next takes.</param>
         private int chooseSliceCount(DrmVBlankClock.Timing timing, long frameNs)
         {
-            int fits = (int)Math.Clamp(timing.PeriodNs / Math.Max(1, frameNs), 1, Math.Max(1, slices));
+            int most = Math.Max(1, slices);
+            frameNs = Math.Max(1, frameNs);
+
+            int fits = (int)Math.Clamp(timing.PeriodNs / frameNs, 1, most);
+            int fitsWithRoom = (int)Math.Clamp((long)(timing.PeriodNs * slice_raise_fit) / frameNs, 1, most);
 
             if (fits < sliceCount)
             {
                 sliceCount = fits;
                 moreSlicesFitSince = 0;
             }
-            else if (fits == sliceCount)
-                moreSlicesFitSince = 0;
-            else if (moreSlicesFitSince == 0)
-                moreSlicesFitSince = Native.MonotonicNs();
-            else if (Native.MonotonicNs() - moreSlicesFitSince >= slice_raise_delay_ns)
+            else if (fitsWithRoom > sliceCount)
             {
-                sliceCount = fits;
-                moreSlicesFitSince = 0;
+                if (moreSlicesFitSince == 0)
+                    moreSlicesFitSince = Native.MonotonicNs();
+                else if (Native.MonotonicNs() - moreSlicesFitSince >= slice_raise_delay_ns)
+                {
+                    sliceCount = fitsWithRoom;
+                    moreSlicesFitSince = 0;
+                }
             }
+            else
+                moreSlicesFitSince = 0;
 
             return sliceCount;
         }
@@ -347,11 +368,12 @@ namespace osu.Desktop.Raster
         private void logSliceCountChange(DrmVBlankClock.Timing timing, int from, int to, long renderNs, long headroom)
         {
             long between = betweenPresents.Percentile(cost_percentile);
+            string rule = to > from ? $" More slices are only used once a frame fits in {slice_raise_fit:0%} of one, for {slice_raise_delay_ns / 1_000_000_000} seconds." : string.Empty;
 
             Logger.Log($"Raster sync: {from} → {to} frame slices per refresh (up to {slices}). A slice at {to} lasts {ms(timing.PeriodNs / to)} ms, "
                        + $"and a frame needs {ms(renderNs + headroom + between)} ms: render {ms(renderNs)} ms, headroom {ms(headroom)} ms, "
                        + $"and {ms(between)} ms from one swap to planning the next (swap call {ms(swapCalls.Percentile(cost_percentile))} ms, "
-                       + $"rest of the frame loop {ms(frameLoops.Percentile(cost_percentile))} ms). Durations are 99th percentiles of the last {cost_history} presents.");
+                       + $"rest of the frame loop {ms(frameLoops.Percentile(cost_percentile))} ms). Durations are 99th percentiles of the last {cost_history} presents.{rule}");
         }
 
         /// <summary>
@@ -390,7 +412,11 @@ namespace osu.Desktop.Raster
             {
                 Native.WaitUntil(plannedTarget, spin_window_ns);
                 presentStart = Native.MonotonicNs();
-                intervalMaxError = Math.Max(intervalMaxError, presentStart - plannedTarget);
+
+                long error = Math.Max(0, presentStart - plannedTarget);
+
+                timingErrors.Add(error);
+                intervalMaxError = Math.Max(intervalMaxError, error);
             }
             else
             {
@@ -476,12 +502,13 @@ namespace osu.Desktop.Raster
                          + $"{intervalLate} late, {intervalMaxError / 1e3:0} µs present timing error, swap call up to {ms(intervalMaxSwap)} ms{overtakenText}";
 
                 // The runtime log keeps what the status note shows, to line up with recordings of the screen afterwards.
-                Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late, present timing error up to {intervalMaxError / 1e3:0} µs, "
+                Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late, "
                            + $"{overtaken} of {flips + overtaken} timed frames overtaken. Milliseconds at p50/p99/max: "
                            + $"render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(cost_percentile))}/{ms(intervalMaxCost)}, "
                            + $"swap call {ms(swapCalls.Percentile(0.5))}/{ms(swapCalls.Percentile(cost_percentile))}/{ms(intervalMaxSwap)}, "
                            + $"rest of the frame loop {ms(frameLoops.Percentile(0.5))}/{ms(frameLoops.Percentile(cost_percentile))}, "
                            + $"swap to next plan {ms(betweenPresents.Percentile(0.5))}/{ms(betweenPresents.Percentile(cost_percentile))}/{ms(intervalMaxBetween)}, "
+                           + $"present timing error {ms(timingErrors.Percentile(0.5))}/{ms(timingErrors.Percentile(cost_percentile))}/{ms(intervalMaxError)}, "
                            + $"headroom {ms(Interlocked.Read(ref headroomNs))}");
 
                 startInterval(end);
