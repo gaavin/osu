@@ -89,6 +89,15 @@ namespace osu.Desktop.Raster
             update_frame_sync_mode?.Invoke(this, null);
         }
 
+        protected override void UpdateFrame()
+        {
+            base.UpdateFrame();
+
+            // The scene is published by now. Waiting here rather than before the frame means the clock, which the update thread
+            // processes after this returns, and the input collected in the next frame are both read once the wait is over.
+            RasterSync.UpdateSync.FinishUpdateFrame(executionMode.Value != ExecutionMode.SingleThread);
+        }
+
         protected override void DrawFrame()
         {
             if (!RasterSync.ShouldPace(findBlocker()))

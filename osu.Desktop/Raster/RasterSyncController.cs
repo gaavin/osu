@@ -227,6 +227,11 @@ namespace osu.Desktop.Raster
         /// </summary>
         private readonly GcPacer gcPacer = new GcPacer();
 
+        /// <summary>
+        /// Times update frames against the draw thread's wake, and measures how old the scene each present draws is.
+        /// </summary>
+        public readonly UpdateSync UpdateSync = new UpdateSync();
+
         // What the slice count was last decided on. Logged every second, since a count that keeps falling back is
         // otherwise only visible at the moment it changes.
         private long lastSlowFrameNs;
@@ -413,6 +418,7 @@ namespace osu.Desktop.Raster
 
                 planned = false;
                 betweenPending = false;
+                UpdateSync.ClearPlan();
                 return false;
             }
 
@@ -444,6 +450,7 @@ namespace osu.Desktop.Raster
             if (timing == null)
             {
                 planned = false;
+                UpdateSync.ClearPlan();
                 return;
             }
 
@@ -518,6 +525,8 @@ namespace osu.Desktop.Raster
             plannedWake = target - cost;
             planned = true;
 
+            UpdateSync.NotePlan(plannedWake, slice);
+
             // A collection that runs while the draw thread sleeps costs it nothing: the thread is inside a blocking
             // call, so the runtime suspends it without waiting for it to reach a safe point. Counting those apart
             // from the rest says how much of the collection load is already free, and how much is in the way.
@@ -528,6 +537,7 @@ namespace osu.Desktop.Raster
 
             Native.SleepUntil(plannedWake);
             wakeTime = Native.MonotonicNs();
+            UpdateSync.NoteWake(wakeTime);
             wakeCollections = GC.CollectionCount(0);
             intervalCollectionsIdle += wakeCollections - planCollections;
             drawEnd = 0;
@@ -655,6 +665,7 @@ namespace osu.Desktop.Raster
         {
             drawEnd = Native.MonotonicNs();
             drawEndCollections = GC.CollectionCount(0);
+            UpdateSync.NoteDrawn();
 
             if (samplingCpu)
                 drawEndCpuTime = Native.ThreadCpuNs();
@@ -722,6 +733,7 @@ namespace osu.Desktop.Raster
             presentCollections = GC.CollectionCount(0);
             intervalCollectionsWaiting += presentCollections - readyCollections;
 
+            UpdateSync.NotePresent(presentStart);
             probe?.NoteSwap(presentStart);
 
             if (probeArmed)
@@ -842,6 +854,8 @@ namespace osu.Desktop.Raster
                            + $"earned by {(intervalGcSamples > 0 ? intervalGcBytes / intervalGcSamples : lastGcBytes) / 1024} KiB allocated between collections. "
                            + $"{gcPacer.TakeForced()} were held for a gap before a frame, giving up {intervalCollectionSkips} slices to make one, "
                            + $"which costs a present {ms(gcPacer.ExpectedPauseNs)} ms against a {gcPacer.BudgetBytes / 1024} KiB budget.");
+
+                Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart));
 
                 // Steered from a whole interval, so a single slow frame doesn't hold every later frame back.
                 if (intervalPresents >= cost_adjust_min_presents)
