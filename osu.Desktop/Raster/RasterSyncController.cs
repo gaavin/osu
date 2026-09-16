@@ -219,6 +219,17 @@ namespace osu.Desktop.Raster
         private long gcAllocated;
         private long intervalGcBytes;
         private int intervalGcSamples;
+
+        // The pauses of this second's collections. Percentiles over recent collections reach back minutes once
+        // collections are rare, so what a second actually paid for has to be counted within the second.
+        private int intervalPauses;
+        private long intervalPauseTotal;
+        private long intervalPauseMax;
+
+        /// <summary>
+        /// The most recent gap between collections, reported in the seconds that saw none of their own.
+        /// </summary>
+        private long lastGcBytes;
         private long intervalMaxCost;
         private long intervalMaxDraw;
         private long intervalMaxFinish;
@@ -714,8 +725,9 @@ namespace osu.Desktop.Raster
 
                 Logger.Log($"Raster sync GC: {gen0}/{gen1}/{gen2} collections, {intervalCollectionsIdle} of them while the draw thread slept and {inPresent} in its way "
                            + $"({intervalCollectionsDrawing} drawing, {intervalCollectionsGpu} waiting for the GPU, {intervalCollectionsWaiting} waiting for the scanline, "
-                           + $"{intervalCollectionsSwapping} swapping). Pause {ms(gcPauses.Percentile(0.5))}/{ms(gcPauses.Percentile(fixed_percentile))} ms at p50/p99, "
-                           + $"earned by {(intervalGcSamples > 0 ? intervalGcBytes / intervalGcSamples / 1024 : 0)} KiB allocated between collections.");
+                           + $"{intervalCollectionsSwapping} swapping). {intervalPauses} paused this second, totalling {ms(intervalPauseTotal)} ms, worst {ms(intervalPauseMax)} ms "
+                           + $"(p50/p99 {ms(gcPauses.Percentile(0.5))}/{ms(gcPauses.Percentile(fixed_percentile))} ms over recent collections, which reach back further the rarer they are), "
+                           + $"earned by {(intervalGcSamples > 0 ? intervalGcBytes / intervalGcSamples : lastGcBytes) / 1024} KiB allocated between collections.");
 
                 // Steered from a whole interval, so a single slow frame doesn't hold every later frame back.
                 if (intervalPresents >= cost_adjust_min_presents)
@@ -753,14 +765,22 @@ namespace osu.Desktop.Raster
             gcIndex = info.Index;
 
             if (info.PauseDurations.Length > 0)
-                gcPauses.Add((long)info.PauseDurations[0].TotalNanoseconds);
+            {
+                long pause = (long)info.PauseDurations[0].TotalNanoseconds;
+
+                gcPauses.Add(pause);
+                intervalPauses++;
+                intervalPauseTotal += pause;
+                intervalPauseMax = Math.Max(intervalPauseMax, pause);
+            }
 
             // What the collection had to be earned by, which is the budget a scheduled collection would have to beat.
             long allocated = GC.GetTotalAllocatedBytes();
 
             if (gcAllocated > 0)
             {
-                intervalGcBytes += allocated - gcAllocated;
+                lastGcBytes = allocated - gcAllocated;
+                intervalGcBytes += lastGcBytes;
                 intervalGcSamples++;
             }
 
@@ -782,6 +802,9 @@ namespace osu.Desktop.Raster
             intervalCollectionsSwapping = 0;
             intervalGcBytes = 0;
             intervalGcSamples = 0;
+            intervalPauses = 0;
+            intervalPauseTotal = 0;
+            intervalPauseMax = 0;
             intervalMaxCost = 0;
             intervalMaxDraw = 0;
             intervalMaxFinish = 0;
