@@ -14,7 +14,7 @@ using osuTK.Graphics;
 namespace osu.Game.Graphics.Raster
 {
     /// <summary>
-    /// A strip down the right edge of the screen that shows where frames take over from each other.
+    /// A strip down the left edge of the screen that shows where frames take over from each other.
     /// </summary>
     /// <remarks>
     /// Frames timed for slices of a refresh are coloured by slice, so the strip holds still with any number of slices and a slice left without a frame
@@ -35,8 +35,8 @@ namespace osu.Game.Graphics.Raster
 
         public TearlineIndicator()
         {
-            Anchor = Anchor.TopRight;
-            Origin = Anchor.TopRight;
+            Anchor = Anchor.TopLeft;
+            Origin = Anchor.TopLeft;
             RelativeSizeAxes = Axes.Y;
             Width = strip_width + tick_width;
         }
@@ -90,11 +90,11 @@ namespace osu.Game.Graphics.Raster
 
                 shader.Bind();
 
-                drawRectangle(renderer, new Vector2(tick_width, 0), new Vector2(strip_width, drawSize.Y), frame % 2 == 0 ? Color4.Magenta : Color4.Lime);
+                drawRectangle(renderer, Vector2.Zero, new Vector2(strip_width, drawSize.Y), frame % 2 == 0 ? Color4.Magenta : Color4.Lime);
 
                 // Quarter marks, to tell where along the screen a tear line sits.
                 for (int i = 1; i < 4; i++)
-                    drawRectangle(renderer, new Vector2(0, drawSize.Y * i / 4 - tick_height / 2), new Vector2(tick_width, tick_height), Color4.White);
+                    drawRectangle(renderer, new Vector2(strip_width, drawSize.Y * i / 4 - tick_height / 2), new Vector2(tick_width, tick_height), Color4.White);
 
                 shader.Unbind();
             }
