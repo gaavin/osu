@@ -90,7 +90,15 @@ namespace osu.Desktop.Raster
         private readonly DurationWindow offsets = new DurationWindow(metric_history);
         private readonly DurationWindow reportAges = new DurationWindow(metric_history);
         private readonly DurationWindow latchToPresent = new DurationWindow(metric_history);
+
+        /// <summary>
+        /// The part of <see cref="latchToPresent"/> taken by cursors drawn after the rest of the frame.
+        /// </summary>
+        private readonly DurationWindow lateLatchToPresent = new DurationWindow(metric_history);
+
         private long takenAt;
+        private bool takenLate;
+        private bool drawingDeferred;
         private int intervalTaken;
         private float intervalMaxOffset;
 #endif
@@ -234,6 +242,7 @@ namespace osu.Desktop.Raster
 
 #if RASTER_METRICS
             takenAt = Native.MonotonicNs();
+            takenLate = drawingDeferred;
             reportAges.Add(takenAt - Volatile.Read(ref latestAt));
 
             float length = offset.Length;
@@ -277,7 +286,14 @@ namespace osu.Desktop.Raster
 
             deferred = null;
             defersDraws = false;
+
+#if RASTER_METRICS
+            drawingDeferred = true;
+#endif
             draw?.DrawLatched(renderer);
+#if RASTER_METRICS
+            drawingDeferred = false;
+#endif
         }
 
 #if RASTER_METRICS
@@ -290,6 +306,10 @@ namespace osu.Desktop.Raster
                 return;
 
             latchToPresent.Add(presentStart - takenAt);
+
+            if (takenLate)
+                lateLatchToPresent.Add(presentStart - takenAt);
+
             takenAt = 0;
         }
 
@@ -306,7 +326,8 @@ namespace osu.Desktop.Raster
                              + $"Update frames had the cursor on the pen {following} times and off it {notFollowing}, and {intervalTaken} draws moved it to the newest report, "
                              + $"by {offsets.Percentile(0.5) / offset_scale:0.0}/{offsets.Percentile(0.99) / offset_scale:0.0}/{intervalMaxOffset:0.0} px at p50/p99/max. "
                              + $"Milliseconds at p50/p99: the newest report was {ms(reportAges.Percentile(0.5))}/{ms(reportAges.Percentile(0.99))} old when drawn, "
-                             + $"and presented {ms(latchToPresent.Percentile(0.5))}/{ms(latchToPresent.Percentile(0.99))} later.";
+                             + $"and presented {ms(latchToPresent.Percentile(0.5))}/{ms(latchToPresent.Percentile(0.99))} later, "
+                             + $"{ms(lateLatchToPresent.Percentile(0.5))}/{ms(lateLatchToPresent.Percentile(0.99))} for cursors drawn after the rest of the frame.";
 
             intervalTaken = 0;
             intervalMaxOffset = 0;
