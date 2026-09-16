@@ -1165,9 +1165,10 @@ namespace osu.Game
 
             loadComponentSingleFile(fpsCounter = new FPSCounter
             {
-                Anchor = Anchor.BottomRight,
-                Origin = Anchor.BottomRight,
-                Margin = new MarginPadding(5),
+                // Beside the tear line indicator, so both are in shot when the screen is recorded.
+                Anchor = Anchor.BottomLeft,
+                Origin = Anchor.BottomLeft,
+                Margin = new MarginPadding(5) { Left = TearlineIndicator.TOTAL_WIDTH + 5 },
             }, topMostOverlayContent.Add);
 
             loadComponentSingleFile(new TearlineIndicator(), topMostOverlayContent.Add);

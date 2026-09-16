@@ -27,6 +27,11 @@ namespace osu.Game.Graphics.Raster
         private const float tick_width = 16;
         private const float tick_height = 2;
 
+        /// <summary>
+        /// How far the strip and its marks reach in from the edge of the screen, for anything that has to sit clear of them.
+        /// </summary>
+        public const float TOTAL_WIDTH = strip_width + tick_width;
+
         [Resolved(canBeNull: true)]
         private IRasterSync? rasterSync { get; set; }
 
@@ -38,7 +43,7 @@ namespace osu.Game.Graphics.Raster
             Anchor = Anchor.TopLeft;
             Origin = Anchor.TopLeft;
             RelativeSizeAxes = Axes.Y;
-            Width = strip_width + tick_width;
+            Width = TOTAL_WIDTH;
         }
 
         [BackgroundDependencyLoader]
