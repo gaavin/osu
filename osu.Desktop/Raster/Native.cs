@@ -27,6 +27,7 @@ namespace osu.Desktop.Raster
         public const uint DRM_MODE_FLAG_DBLSCAN = 1 << 5;
 
         private const int clock_monotonic = 1;
+        private const int clock_thread_cputime_id = 3;
         private const int timer_abstime = 1;
         private const int pr_set_timerslack = 29;
 
@@ -137,6 +138,16 @@ namespace osu.Desktop.Raster
         {
             TimeSpec ts;
             clock_gettime(clock_monotonic, &ts);
+            return ts.Seconds * 1_000_000_000 + ts.NanoSeconds;
+        }
+
+        /// <summary>
+        /// The processor time the calling thread has used, in nanoseconds. Wall clock time it does not account for was spent suspended or preempted.
+        /// </summary>
+        public static long ThreadCpuNs()
+        {
+            TimeSpec ts;
+            clock_gettime(clock_thread_cputime_id, &ts);
             return ts.Seconds * 1_000_000_000 + ts.NanoSeconds;
         }
 
