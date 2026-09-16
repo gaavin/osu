@@ -102,7 +102,26 @@ namespace osu.Desktop.Raster
         private volatile string status = "Off";
 
         // Draw thread only.
+
+        /// <summary>
+        /// From the draw thread waking to the frame being finished on the GPU: <see cref="draws"/>, then <see cref="gpuFinishes"/>.
+        /// </summary>
         private readonly DurationWindow renderCosts = new DurationWindow(cost_history);
+
+        /// <summary>
+        /// The draw thread's own work on a frame, up to the point the GPU is asked to finish it.
+        /// </summary>
+        private readonly DurationWindow draws = new DurationWindow(cost_history);
+
+        /// <summary>
+        /// Waiting for the GPU to finish a frame the draw thread has already submitted.
+        /// </summary>
+        private readonly DurationWindow gpuFinishes = new DurationWindow(cost_history);
+
+        /// <summary>
+        /// How long past the moment a frame had to start drawing the draw thread actually woke, which eats the same margin as a slow frame.
+        /// </summary>
+        private readonly DurationWindow wakeOvershoots = new DurationWindow(cost_history);
 
         /// <summary>
         /// From starting one timed swap to planning the next present: <see cref="swapCalls"/>, then <see cref="frameLoops"/>.
@@ -129,9 +148,11 @@ namespace osu.Desktop.Raster
         private DrmVBlankClock.Timing? plannedTiming;
         private long plannedTarget;
         private int? plannedSlice;
+        private long plannedWake;
         private long lastTarget;
         private double? steeredOffset;
         private long wakeTime;
+        private long drawEnd;
         private long presentStart;
         private long swapEnd;
         private bool timerSlackSet;
@@ -146,6 +167,9 @@ namespace osu.Desktop.Raster
         private int intervalLate;
         private int intervalSkipped;
         private long intervalMaxCost;
+        private long intervalMaxDraw;
+        private long intervalMaxFinish;
+        private long intervalMaxWake;
         private long intervalMaxSwap;
         private long intervalMaxBetween;
         private long intervalMaxError;
@@ -340,10 +364,17 @@ namespace osu.Desktop.Raster
 
             plannedTiming = timing;
             plannedTarget = target;
+            plannedWake = target - cost;
             planned = true;
 
-            Native.SleepUntil(target - cost);
+            Native.SleepUntil(plannedWake);
             wakeTime = Native.MonotonicNs();
+            drawEnd = 0;
+
+            long overshoot = Math.Max(0, wakeTime - plannedWake);
+
+            wakeOvershoots.Add(overshoot);
+            intervalMaxWake = Math.Max(intervalMaxWake, overshoot);
         }
 
         /// <summary>
@@ -410,7 +441,8 @@ namespace osu.Desktop.Raster
             string rule = to > from ? $" More slices are only used once a frame fits in {slice_raise_fit:0%} of one, for {slice_raise_delay_ns / 1_000_000_000} seconds." : string.Empty;
 
             Logger.Log($"Raster sync: {from} → {to} frame slices per refresh (up to {slices}). A slice at {to} lasts {ms(timing.PeriodNs / to)} ms, "
-                       + $"and a frame needs {ms(renderNs + headroom + between)} ms: render {ms(renderNs)} ms at the {costPercentile:0.0%} percentile, headroom {ms(headroom)} ms, "
+                       + $"and a frame needs {ms(renderNs + headroom + between)} ms: render {ms(renderNs)} ms at the {costPercentile:0.0%} percentile "
+                       + $"(draw {ms(draws.Percentile(costPercentile))} ms, GPU finish {ms(gpuFinishes.Percentile(costPercentile))} ms), headroom {ms(headroom)} ms, "
                        + $"and {ms(between)} ms from one swap to planning the next (swap call {ms(swapCalls.Percentile(fixed_percentile))} ms, "
                        + $"rest of the frame loop {ms(frameLoops.Percentile(fixed_percentile))} ms).{rule}");
         }
@@ -435,6 +467,11 @@ namespace osu.Desktop.Raster
         }
 
         /// <summary>
+        /// Draw thread, once the frame has been submitted and before the GPU is waited on, so the draw thread's own work can be told from the GPU's.
+        /// </summary>
+        public void NoteDrawFinished() => drawEnd = Native.MonotonicNs();
+
+        /// <summary>
         /// Holds a finished frame until its target scanline. Draw thread, after the GPU has finished the frame.
         /// </summary>
         public void WaitForPlannedPresent()
@@ -444,6 +481,17 @@ namespace osu.Desktop.Raster
 
             renderCosts.Add(cost);
             intervalMaxCost = Math.Max(intervalMaxCost, cost);
+
+            if (drawEnd >= wakeTime)
+            {
+                long draw = drawEnd - wakeTime;
+                long finish = ready - drawEnd;
+
+                draws.Add(draw);
+                gpuFinishes.Add(finish);
+                intervalMaxDraw = Math.Max(intervalMaxDraw, draw);
+                intervalMaxFinish = Math.Max(intervalMaxFinish, finish);
+            }
 
             armProbe();
 
@@ -533,6 +581,7 @@ namespace osu.Desktop.Raster
                 int overtaken = Interlocked.Exchange(ref intervalOvertaken, 0);
                 double presentsPerSecond = intervalPresents * 1e9 / (end - intervalStart);
                 double lateFraction = (double)intervalLate / intervalPresents;
+                long margin = renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs);
 
                 int gen0 = GC.CollectionCount(0) - intervalGen0;
                 int gen1 = GC.CollectionCount(1) - intervalGen1;
@@ -542,15 +591,18 @@ namespace osu.Desktop.Raster
                 string overtakenText = flips + overtaken > 0 ? $", {overtaken} of {flips + overtaken} timed frames overtaken by the next before they flipped" : string.Empty;
 
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
-                         + $"frames start {ms(renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs))} ms before their scanline, "
+                         + $"frames start {ms(margin)} ms before their scanline, "
                          + $"{intervalLate} late, {intervalMaxError / 1e3:0} µs present timing error, swap call up to {ms(intervalMaxSwap)} ms{overtakenText}";
 
                 // The runtime log keeps what the status note shows, to line up with recordings of the screen afterwards.
                 Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late ({lateFraction:0.0%}, aiming for {late_target:0%}), "
                            + $"{overtaken} of {flips + overtaken} timed frames overtaken, GC {gen0}/{gen1}/{gen2}. "
-                           + $"Frames start {ms(renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs))} ms before their scanline "
-                           + $"(render at the {costPercentile:0.0%} percentile, headroom {ms(Interlocked.Read(ref headroomNs))} ms). Milliseconds at p50/p99/max: "
-                           + $"render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(fixed_percentile))}/{ms(intervalMaxCost)}, "
+                           + $"Frames start {ms(margin)} ms before their scanline (render at the {costPercentile:0.0%} percentile, headroom {ms(Interlocked.Read(ref headroomNs))} ms).");
+
+                Logger.Log($"Raster sync times, milliseconds at p50/p99/max: render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(fixed_percentile))}/{ms(intervalMaxCost)} "
+                           + $"= draw {ms(draws.Percentile(0.5))}/{ms(draws.Percentile(fixed_percentile))}/{ms(intervalMaxDraw)} "
+                           + $"+ GPU finish {ms(gpuFinishes.Percentile(0.5))}/{ms(gpuFinishes.Percentile(fixed_percentile))}/{ms(intervalMaxFinish)}; "
+                           + $"wake overshoot {ms(wakeOvershoots.Percentile(0.5))}/{ms(wakeOvershoots.Percentile(fixed_percentile))}/{ms(intervalMaxWake)}, "
                            + $"swap call {ms(swapCalls.Percentile(0.5))}/{ms(swapCalls.Percentile(fixed_percentile))}/{ms(intervalMaxSwap)}, "
                            + $"rest of the frame loop {ms(frameLoops.Percentile(0.5))}/{ms(frameLoops.Percentile(fixed_percentile))}, "
                            + $"swap to next plan {ms(betweenPresents.Percentile(0.5))}/{ms(betweenPresents.Percentile(fixed_percentile))}/{ms(intervalMaxBetween)}, "
@@ -576,6 +628,9 @@ namespace osu.Desktop.Raster
             intervalLate = 0;
             intervalSkipped = 0;
             intervalMaxCost = 0;
+            intervalMaxDraw = 0;
+            intervalMaxFinish = 0;
+            intervalMaxWake = 0;
             intervalMaxSwap = 0;
             intervalMaxBetween = 0;
             intervalMaxError = 0;
