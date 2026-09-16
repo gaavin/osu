@@ -57,12 +57,13 @@ namespace osu.Desktop.Raster
         /// A frame that overruns the margin only starts late, but one that overruns its slice also leaves the next slice without a frame of its own.
         /// </summary>
         /// <remarks>
-        /// This is what limits the count, rather than how quickly it climbs. Measured in play, a frame needs 1.42 ms at
-        /// 0.999 and 1.01 ms at 0.99, which is the difference between four slices and six, or about 0.58 ms of frame age.
-        /// What the strictness buys is slices that never go without a frame of their own, so it can be set for a play
-        /// while skipped slices are watched.
+        /// This is what limits the count, rather than how quickly it climbs. Measured on the same map, judging the count
+        /// on all but the slowest 1% of frames rather than the slowest 0.1% took it from 3.7 slices to 6.3, and the gap
+        /// between presents — which is how old a frame is when it reaches the screen — from 1.88 ms to 1.11 ms.
+        /// It is paid for in slices that go without a frame of their own, which rose from 0.3 a second to 7.2, though
+        /// that is still under one slice in a hundred, and the play it was measured on felt better rather than worse.
         /// </remarks>
-        private static readonly double slice_fit_percentile = envFraction(@"OSU_RASTER_SLICE_FIT", 0.999);
+        private static readonly double slice_fit_percentile = envFraction(@"OSU_RASTER_SLICE_FIT", 0.99);
 
         private static double envFraction(string name, double fallback)
         {
