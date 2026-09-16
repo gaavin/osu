@@ -169,6 +169,11 @@ namespace osu.Desktop.Raster
         /// </summary>
         private readonly DurationWindow gcPauses = new DurationWindow(cost_history);
 
+        /// <summary>
+        /// Holds collections until a present has set time aside for one.
+        /// </summary>
+        private readonly GcPacer gcPacer = new GcPacer();
+
         private double costPercentile = cost_percentile_initial;
         private bool betweenPending;
         private int sliceCount = 1;
@@ -204,6 +209,12 @@ namespace osu.Desktop.Raster
         private int intervalPresents;
         private int intervalLate;
         private int intervalSkipped;
+
+        /// <summary>
+        /// Slices deliberately given up so that a collection had somewhere to run, which are not uneven pacing.
+        /// </summary>
+        private int intervalCollectionSkips;
+
         private int intervalDrawsWithCollection;
         private long intervalMaxDrawWithCollection;
 
@@ -391,7 +402,11 @@ namespace osu.Desktop.Raster
 
             long renderNs = renderCosts.Percentile(costPercentile);
             long headroom = Interlocked.Read(ref headroomNs);
-            long cost = renderNs + headroom;
+
+            // A collection that is due is paid for by this present: adding it to the cost aims the present at a later
+            // slice, which leaves the gap before the frame starts drawing long enough to collect in.
+            long reserved = gcPacer.Reserve();
+            long cost = renderNs + headroom + reserved;
 
             int previousCount = sliceCount;
             int count = 1;
@@ -422,9 +437,17 @@ namespace osu.Desktop.Raster
             if (target - lastTarget < slice / 2)
                 target += slice;
 
-            // Slices left without a frame of their own since the last present.
+            // Slices left without a frame of their own since the last present. A slice given up to hold a collection is
+            // counted apart from those, since skipped slices are how uneven pacing shows and this kind was asked for.
             if (followsPresent && count == previousCount && target - lastTarget > slice * 3 / 2)
-                intervalSkipped += (int)((target - lastTarget + slice / 2) / slice) - 1;
+            {
+                int missed = (int)((target - lastTarget + slice / 2) / slice) - 1;
+
+                if (reserved > 0)
+                    intervalCollectionSkips += missed;
+                else
+                    intervalSkipped += missed;
+            }
 
             // Targets are whole slices from the anchor, whose slice is the one at the top of the screen.
             long sliceNumber = (target - anchor) / slice;
@@ -439,6 +462,9 @@ namespace osu.Desktop.Raster
             // call, so the runtime suspends it without waiting for it to reach a safe point. Counting those apart
             // from the rest says how much of the collection load is already free, and how much is in the way.
             planCollections = GC.CollectionCount(0);
+
+            // Inside the sleep window as far as the counters are concerned, which is exactly where it should land.
+            gcPacer.CollectIfReserved();
 
             Native.SleepUntil(plannedWake);
             wakeTime = Native.MonotonicNs();
@@ -727,7 +753,9 @@ namespace osu.Desktop.Raster
                            + $"({intervalCollectionsDrawing} drawing, {intervalCollectionsGpu} waiting for the GPU, {intervalCollectionsWaiting} waiting for the scanline, "
                            + $"{intervalCollectionsSwapping} swapping). {intervalPauses} paused this second, totalling {ms(intervalPauseTotal)} ms, worst {ms(intervalPauseMax)} ms "
                            + $"(p50/p99 {ms(gcPauses.Percentile(0.5))}/{ms(gcPauses.Percentile(fixed_percentile))} ms over recent collections, which reach back further the rarer they are), "
-                           + $"earned by {(intervalGcSamples > 0 ? intervalGcBytes / intervalGcSamples : lastGcBytes) / 1024} KiB allocated between collections.");
+                           + $"earned by {(intervalGcSamples > 0 ? intervalGcBytes / intervalGcSamples : lastGcBytes) / 1024} KiB allocated between collections. "
+                           + $"{gcPacer.TakeForced()} were held for a gap before a frame, giving up {intervalCollectionSkips} slices to make one, "
+                           + $"which costs a present {ms(gcPacer.ExpectedPauseNs)} ms against a {gcPacer.BudgetBytes / 1024} KiB budget.");
 
                 // Steered from a whole interval, so a single slow frame doesn't hold every later frame back.
                 if (intervalPresents >= cost_adjust_min_presents)
@@ -764,17 +792,17 @@ namespace osu.Desktop.Raster
 
             gcIndex = info.Index;
 
-            if (info.PauseDurations.Length > 0)
-            {
-                long pause = (long)info.PauseDurations[0].TotalNanoseconds;
+            long pause = info.PauseDurations.Length > 0 ? (long)info.PauseDurations[0].TotalNanoseconds : 0;
 
+            if (pause > 0)
+            {
                 gcPauses.Add(pause);
                 intervalPauses++;
                 intervalPauseTotal += pause;
                 intervalPauseMax = Math.Max(intervalPauseMax, pause);
             }
 
-            // What the collection had to be earned by, which is the budget a scheduled collection would have to beat.
+            // What the collection had to be earned by, which is the budget the pacer has to get to first.
             long allocated = GC.GetTotalAllocatedBytes();
 
             if (gcAllocated > 0)
@@ -785,6 +813,7 @@ namespace osu.Desktop.Raster
             }
 
             gcAllocated = allocated;
+            gcPacer.NoteCollection(allocated, lastGcBytes, pause);
         }
 
         private void startInterval(long now)
@@ -793,6 +822,7 @@ namespace osu.Desktop.Raster
             intervalPresents = 0;
             intervalLate = 0;
             intervalSkipped = 0;
+            intervalCollectionSkips = 0;
             intervalDrawsWithCollection = 0;
             intervalMaxDrawWithCollection = 0;
             intervalCollectionsIdle = 0;
