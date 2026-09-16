@@ -2,6 +2,7 @@
 // See the LICENCE file in the repository root for full licence text.
 
 using System;
+using System.Globalization;
 using System.Threading;
 using osu.Framework.Bindables;
 using osu.Framework.Logging;
@@ -55,7 +56,22 @@ namespace osu.Desktop.Raster
         /// The fraction of recent presents a slice count has to fit inside a slice, which is stricter than the margin frames start on.
         /// A frame that overruns the margin only starts late, but one that overruns its slice also leaves the next slice without a frame of its own.
         /// </summary>
-        private const double slice_fit_percentile = 0.999;
+        /// <remarks>
+        /// This is what limits the count, rather than how quickly it climbs. Measured in play, a frame needs 1.42 ms at
+        /// 0.999 and 1.01 ms at 0.99, which is the difference between four slices and six, or about 0.58 ms of frame age.
+        /// What the strictness buys is slices that never go without a frame of their own, so it can be set for a play
+        /// while skipped slices are watched.
+        /// </remarks>
+        private static readonly double slice_fit_percentile = envFraction(@"OSU_RASTER_SLICE_FIT", 0.999);
+
+        private static double envFraction(string name, double fallback)
+        {
+            return double.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Float, CultureInfo.InvariantCulture, out double value)
+                   && value > 0
+                   && value < 1
+                ? value
+                : fallback;
+        }
 
         /// <summary>
         /// A looser rule, logged beside the one in force but never acted on, to say what relaxing it would allow.
