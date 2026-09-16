@@ -3,6 +3,8 @@
 
 #nullable disable
 
+using System;
+
 using osu.Framework.Allocation;
 using osu.Framework.Bindables;
 using osu.Framework.Extensions.Color4Extensions;
@@ -135,7 +137,18 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
 
                 latch = cursor.pointerLatch;
                 position = cursor.ToScreenSpace(cursor.OriginPosition);
-                following = latch?.IsFollowingPen(position) == true;
+
+                if (latch == null)
+                {
+                    following = false;
+                }
+                else
+                {
+                    // The scaled content can reach past the cursor's own size, and grows further when a key is pressed.
+                    var extent = (cursor.cursorScaleContainer ?? (Drawable)cursor).ScreenSpaceDrawQuad.AABBFloat;
+                    following = latch.IsFollowingPen(position, Math.Max(0, position.Y - extent.Top) * 1.3f);
+                }
+
                 offsetTaken = false;
             }
 

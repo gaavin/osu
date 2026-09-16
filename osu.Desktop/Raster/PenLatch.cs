@@ -64,6 +64,10 @@ namespace osu.Desktop.Raster
         private int nextReport;
         private long latest;
 
+        // Written on the update thread, read on the draw thread.
+        private volatile bool cursorFollowing;
+        private float cursorExtentAbove;
+
         // Draw thread only.
         private bool defersDraws;
         private ILatchedDraw? deferred;
@@ -181,7 +185,27 @@ namespace osu.Desktop.Raster
 
         void IPressureHandler.SetPressure(float percentage) => pressure.SetPressure(percentage);
 
-        public bool IsFollowingPen(Vector2 screenSpacePosition)
+        public bool IsFollowingPen(Vector2 screenSpacePosition, float extentAbove)
+        {
+            bool isFollowing = isOnRecentReport(screenSpacePosition);
+
+            if (isFollowing)
+                Volatile.Write(ref cursorExtentAbove, extentAbove);
+
+            cursorFollowing = isFollowing;
+            return isFollowing;
+        }
+
+        /// <summary>
+        /// The screen row the top of the cursor is at by the newest pen report, if the latest update frame had the cursor following the pen. Draw thread.
+        /// </summary>
+        public bool TryGetCursorTop(out float row)
+        {
+            row = unpack(Volatile.Read(ref latest)).Y - Volatile.Read(ref cursorExtentAbove);
+            return cursorFollowing;
+        }
+
+        private bool isOnRecentReport(Vector2 screenSpacePosition)
         {
             int written = Math.Min(Volatile.Read(ref nextReport), history);
 
@@ -234,11 +258,11 @@ namespace osu.Desktop.Raster
         }
 
         /// <summary>
-        /// Draw thread, before a frame is drawn: whether its present is timed, which is what gives a held draw somewhere to go.
+        /// Draw thread, before a frame is drawn: whether its present is the one timed to tear just above the cursor, which is the only one a held draw is worth it for.
         /// </summary>
-        public void BeginFrame(bool timed)
+        public void BeginFrame(bool timedForCursor)
         {
-            defersDraws = timed && LATE;
+            defersDraws = timedForCursor && LATE;
             deferred = null;
         }
 
