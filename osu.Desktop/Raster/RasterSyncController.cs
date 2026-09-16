@@ -264,7 +264,23 @@ namespace osu.Desktop.Raster
         /// </summary>
         private static readonly int cursor_tearline_lead = int.TryParse(Environment.GetEnvironmentVariable(@"OSU_CURSOR_TEARLINE_LEAD"), out int lead) && lead >= 0 ? lead : 32;
 
+        /// <summary>
+        /// How many evenly spaced positions a refresh offers the cursor's tear line, counted from the blanking interval's, or 0 to follow the cursor
+        /// to the scanline. <c>OSU_CURSOR_TEARLINE_BANDS</c> sets it.
+        /// </summary>
+        /// <remarks>
+        /// The cursor's present is timed by the cursor's height, so the frame drawn below it moves in time with it: a jump across half the screen
+        /// shifts that frame by half a refresh, and everything under the cursor advances unevenly. Holding the tear line to a few positions only
+        /// shifts it when the cursor crosses into another band, by one band, at the cost of the cursor sitting up to a band below its tear line.
+        /// </remarks>
+        private static readonly int cursor_tearline_bands = int.TryParse(Environment.GetEnvironmentVariable(@"OSU_CURSOR_TEARLINE_BANDS"), out int bands) && bands >= 0 ? bands : 0;
+
         private bool plannedForCursor;
+        private double plannedCursorLine;
+
+#if RASTER_METRICS
+        private double lastCursorLine = double.NaN;
+#endif
         private long lastGridTarget;
         private long lastCursorTarget;
 
@@ -367,6 +383,9 @@ namespace osu.Desktop.Raster
         private int intervalLateDraws;
         private int intervalCursorPresents;
         private int intervalCursorSkips;
+        private int intervalCursorOnlyRefreshes;
+        private double intervalCursorLineMoves;
+        private double intervalMaxCursorLineMove;
         private long intervalMaxLateDraw;
 #endif
 
@@ -579,7 +598,18 @@ namespace osu.Desktop.Raster
             if (PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
             {
                 long lateNs = lateDraws.Percentile(costPercentile);
-                double line = cursorTop - cursor_tearline_lead + offset;
+                double line = cursorTop - cursor_tearline_lead;
+
+                if (cursor_tearline_bands > 0)
+                {
+                    double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
+                    double band = (double)timing.VTotal / cursor_tearline_bands;
+
+                    line = blankingLine + Math.Floor((line - blankingLine) / band) * band;
+                }
+
+                plannedCursorLine = line;
+                line += offset;
                 long cursorBase = timing.VBlankNs + (long)(line * timing.PeriodNs / timing.VTotal);
                 long cursorTarget = cursorBase + ceilingDivide(now + cost + lateNs - cursorBase, timing.PeriodNs) * timing.PeriodNs;
 
@@ -957,10 +987,24 @@ namespace osu.Desktop.Raster
 
             if (plannedForCursor)
             {
-                lastCursorTarget = plannedTarget;
 #if RASTER_METRICS
                 intervalCursorPresents++;
+
+                // A refresh whose slices all went to the cursor's present, as when the cursor is too close to the blanking interval's tear line for both.
+                if (lastTarget == lastCursorTarget)
+                    intervalCursorOnlyRefreshes++;
+
+                if (!double.IsNaN(lastCursorLine))
+                {
+                    double moved = Math.Abs(plannedCursorLine - lastCursorLine);
+
+                    intervalCursorLineMoves += moved;
+                    intervalMaxCursorLineMove = Math.Max(intervalMaxCursorLineMove, moved);
+                }
+
+                lastCursorLine = plannedCursorLine;
 #endif
+                lastCursorTarget = plannedTarget;
             }
             else
                 lastGridTarget = plannedTarget;
@@ -1029,7 +1073,10 @@ namespace osu.Desktop.Raster
                     Logger.Log(host.PenLatch.TakeIntervalSummary()
                                + $" {intervalLateDraws} were drawn after the rest of the frame finished, taking {ms(lateDraws.Percentile(0.5))}/{ms(lateDraws.Percentile(fixed_percentile))}/{ms(intervalMaxLateDraw)} ms at p50/p99/max"
                                + $" (drawing and submitting {ms(lateDrawSubmits.Percentile(0.5))}/{ms(lateDrawSubmits.Percentile(fixed_percentile))}, {(late_draw_waits_for_gpu ? "then waiting for the GPU" : "not waiting for the GPU")})."
-                               + $" {intervalCursorPresents} presents tore {cursor_tearline_lead} lines above the cursor, crowding out {intervalCursorSkips} slices.");
+                               + $" {intervalCursorPresents} presents tore {cursor_tearline_lead} lines above the cursor, crowding out {intervalCursorSkips} slices,"
+                               + $" and {intervalCursorOnlyRefreshes} followed another of theirs with no slice between."
+                               + $" Their tear line moved {(intervalCursorPresents > 1 ? intervalCursorLineMoves / (intervalCursorPresents - 1) : 0):0} scanlines between them on average, {intervalMaxCursorLineMove:0} at most"
+                               + $" ({(cursor_tearline_bands > 0 ? $"held to {cursor_tearline_bands} positions a refresh" : "following the cursor")}).");
                 }
 #else
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
@@ -1132,6 +1179,9 @@ namespace osu.Desktop.Raster
             intervalLateDraws = 0;
             intervalCursorPresents = 0;
             intervalCursorSkips = 0;
+            intervalCursorOnlyRefreshes = 0;
+            intervalCursorLineMoves = 0;
+            intervalMaxCursorLineMove = 0;
             intervalMaxLateDraw = 0;
 #endif
             Interlocked.Exchange(ref intervalFlips, 0);
