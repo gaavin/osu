@@ -35,11 +35,21 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// The share of presents allowed to finish after their scanline. Frames are drawn as late as that allows, so the scene they show is as new as possible.
         /// </summary>
-        private const double late_target = 0.02;
+        /// <remarks>
+        /// This sets the margin a frame starts on, which is the half of frame age that the slice count does not decide:
+        /// measured in play, 0.79 ms of margin against a 1.09 ms gap between presents. Allowing more frames to finish
+        /// late pushes the prediction down and the margin with it, and pays for it in tear lines that land past the
+        /// scanline they were aimed at, so it can be set for a play.
+        /// </remarks>
+        private static readonly double late_target = envFraction(@"OSU_RASTER_LATE_TARGET", 0.02);
 
         private const double cost_percentile_step_up = 0.01;
         private const double cost_percentile_step_down = 0.005;
-        private const double cost_percentile_min = 0.8;
+        /// <summary>
+        /// How far down the prediction may be steered. Well clear of where it settles at the default target, which is
+        /// around 99%, so this only comes into play when many more frames are allowed to finish late.
+        /// </summary>
+        private const double cost_percentile_min = 0.5;
         private const double cost_percentile_max = 0.999;
 
         /// <summary>
