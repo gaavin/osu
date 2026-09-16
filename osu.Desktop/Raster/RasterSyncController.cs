@@ -52,6 +52,12 @@ namespace osu.Desktop.Raster
         private const double fixed_percentile = 0.99;
 
         /// <summary>
+        /// The fraction of recent presents a slice count has to fit inside a slice, which is stricter than the margin frames start on.
+        /// A frame that overruns the margin only starts late, but one that overruns its slice also leaves the next slice without a frame of its own.
+        /// </summary>
+        private const double slice_fit_percentile = 0.999;
+
+        /// <summary>
         /// One in how many frames has its processor time read. Reading it is a system call, which a frame pays for whether or not it is sampled.
         /// </summary>
         private const int cpu_sample_interval = 16;
@@ -360,10 +366,14 @@ namespace osu.Desktop.Raster
 
             if (mode == RasterSyncMode.FrameSlices)
             {
-                count = chooseSliceCount(timing, cost + betweenPresents.Percentile(fixed_percentile));
+                // Frames that overrun a slice leave the next one without a frame of its own, which shows as uneven pacing rather than latency,
+                // so the count is decided on a stricter percentile than the margin a frame starts on.
+                long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + headroom + betweenPresents.Percentile(slice_fit_percentile);
+
+                count = chooseSliceCount(timing, slowFrameNs);
 
                 if (count != previousCount)
-                    logSliceCountChange(timing, previousCount, count, renderNs, headroom);
+                    logSliceCountChange(timing, previousCount, count, slowFrameNs, headroom);
             }
 
             long slice = timing.PeriodNs / count;
@@ -465,16 +475,15 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Logs where a frame's time went when the slice count changes, since that decides how many slices fit. Draw thread.
         /// </summary>
-        private void logSliceCountChange(DrmVBlankClock.Timing timing, int from, int to, long renderNs, long headroom)
+        private void logSliceCountChange(DrmVBlankClock.Timing timing, int from, int to, long frameNs, long headroom)
         {
-            long between = betweenPresents.Percentile(fixed_percentile);
             string rule = to > from ? $" More slices are only used once a frame fits in {slice_raise_fit:0%} of one, for {slice_raise_delay_ns / 1_000_000_000} seconds." : string.Empty;
 
             Logger.Log($"Raster sync: {from} → {to} frame slices per refresh (up to {slices}). A slice at {to} lasts {ms(timing.PeriodNs / to)} ms, "
-                       + $"and a frame needs {ms(renderNs + headroom + between)} ms: render {ms(renderNs)} ms at the {costPercentile:0.0%} percentile "
-                       + $"(draw {ms(draws.Percentile(costPercentile))} ms, GPU finish {ms(gpuFinishes.Percentile(costPercentile))} ms), headroom {ms(headroom)} ms, "
-                       + $"and {ms(between)} ms from one swap to planning the next (swap call {ms(swapCalls.Percentile(fixed_percentile))} ms, "
-                       + $"rest of the frame loop {ms(frameLoops.Percentile(fixed_percentile))} ms).{rule}");
+                       + $"and all but the slowest {1 - slice_fit_percentile:0.0%} of frames need {ms(frameNs)} ms: render {ms(renderCosts.Percentile(slice_fit_percentile))} ms "
+                       + $"(draw {ms(draws.Percentile(slice_fit_percentile))} ms, GPU finish {ms(gpuFinishes.Percentile(slice_fit_percentile))} ms), headroom {ms(headroom)} ms, "
+                       + $"and {ms(betweenPresents.Percentile(slice_fit_percentile))} ms from one swap to planning the next "
+                       + $"(swap call {ms(swapCalls.Percentile(slice_fit_percentile))} ms, rest of the frame loop {ms(frameLoops.Percentile(slice_fit_percentile))} ms).{rule}");
         }
 
         /// <summary>
