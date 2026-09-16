@@ -114,6 +114,18 @@ namespace osu.Desktop.Raster
         private readonly DurationWindow draws = new DurationWindow(cost_history);
 
         /// <summary>
+        /// The processor time of the same work. What the wall clock has on top of it was spent suspended, waiting or preempted.
+        /// </summary>
+        private readonly DurationWindow drawCpuTimes = new DurationWindow(cost_history);
+
+        /// <summary>
+        /// Draws a garbage collection ran during, kept apart from <see cref="drawsWithoutCollection"/> to say how much of the draw tail is collections.
+        /// </summary>
+        private readonly DurationWindow drawsWithCollection = new DurationWindow(cost_history);
+
+        private readonly DurationWindow drawsWithoutCollection = new DurationWindow(cost_history);
+
+        /// <summary>
         /// Waiting for the GPU to finish a frame the draw thread has already submitted.
         /// </summary>
         private readonly DurationWindow gpuFinishes = new DurationWindow(cost_history);
@@ -152,7 +164,11 @@ namespace osu.Desktop.Raster
         private long lastTarget;
         private double? steeredOffset;
         private long wakeTime;
+        private long wakeCpuTime;
+        private int wakeCollections;
         private long drawEnd;
+        private long drawEndCpuTime;
+        private int drawEndCollections;
         private long presentStart;
         private long swapEnd;
         private bool timerSlackSet;
@@ -166,6 +182,7 @@ namespace osu.Desktop.Raster
         private int intervalPresents;
         private int intervalLate;
         private int intervalSkipped;
+        private int intervalDrawsWithCollection;
         private long intervalMaxCost;
         private long intervalMaxDraw;
         private long intervalMaxFinish;
@@ -369,6 +386,8 @@ namespace osu.Desktop.Raster
 
             Native.SleepUntil(plannedWake);
             wakeTime = Native.MonotonicNs();
+            wakeCpuTime = Native.ThreadCpuNs();
+            wakeCollections = GC.CollectionCount(0);
             drawEnd = 0;
 
             long overshoot = Math.Max(0, wakeTime - plannedWake);
@@ -469,7 +488,12 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Draw thread, once the frame has been submitted and before the GPU is waited on, so the draw thread's own work can be told from the GPU's.
         /// </summary>
-        public void NoteDrawFinished() => drawEnd = Native.MonotonicNs();
+        public void NoteDrawFinished()
+        {
+            drawEnd = Native.MonotonicNs();
+            drawEndCpuTime = Native.ThreadCpuNs();
+            drawEndCollections = GC.CollectionCount(0);
+        }
 
         /// <summary>
         /// Holds a finished frame until its target scanline. Draw thread, after the GPU has finished the frame.
@@ -489,6 +513,16 @@ namespace osu.Desktop.Raster
 
                 draws.Add(draw);
                 gpuFinishes.Add(finish);
+                drawCpuTimes.Add(Math.Max(0, drawEndCpuTime - wakeCpuTime));
+
+                if (drawEndCollections != wakeCollections)
+                {
+                    drawsWithCollection.Add(draw);
+                    intervalDrawsWithCollection++;
+                }
+                else
+                    drawsWithoutCollection.Add(draw);
+
                 intervalMaxDraw = Math.Max(intervalMaxDraw, draw);
                 intervalMaxFinish = Math.Max(intervalMaxFinish, finish);
             }
@@ -601,8 +635,11 @@ namespace osu.Desktop.Raster
 
                 Logger.Log($"Raster sync times, milliseconds at p50/p99/max: render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(fixed_percentile))}/{ms(intervalMaxCost)} "
                            + $"= draw {ms(draws.Percentile(0.5))}/{ms(draws.Percentile(fixed_percentile))}/{ms(intervalMaxDraw)} "
-                           + $"+ GPU finish {ms(gpuFinishes.Percentile(0.5))}/{ms(gpuFinishes.Percentile(fixed_percentile))}/{ms(intervalMaxFinish)}; "
-                           + $"wake overshoot {ms(wakeOvershoots.Percentile(0.5))}/{ms(wakeOvershoots.Percentile(fixed_percentile))}/{ms(intervalMaxWake)}, "
+                           + $"+ GPU finish {ms(gpuFinishes.Percentile(0.5))}/{ms(gpuFinishes.Percentile(fixed_percentile))}/{ms(intervalMaxFinish)}. "
+                           + $"Of that draw, processor time {ms(drawCpuTimes.Percentile(0.5))}/{ms(drawCpuTimes.Percentile(fixed_percentile))}, "
+                           + $"and {intervalDrawsWithCollection} draws had a collection run during them "
+                           + $"(p99 {ms(drawsWithCollection.Percentile(fixed_percentile))} against {ms(drawsWithoutCollection.Percentile(fixed_percentile))} without). "
+                           + $"Wake overshoot {ms(wakeOvershoots.Percentile(0.5))}/{ms(wakeOvershoots.Percentile(fixed_percentile))}/{ms(intervalMaxWake)}, "
                            + $"swap call {ms(swapCalls.Percentile(0.5))}/{ms(swapCalls.Percentile(fixed_percentile))}/{ms(intervalMaxSwap)}, "
                            + $"rest of the frame loop {ms(frameLoops.Percentile(0.5))}/{ms(frameLoops.Percentile(fixed_percentile))}, "
                            + $"swap to next plan {ms(betweenPresents.Percentile(0.5))}/{ms(betweenPresents.Percentile(fixed_percentile))}/{ms(intervalMaxBetween)}, "
@@ -627,6 +664,7 @@ namespace osu.Desktop.Raster
             intervalPresents = 0;
             intervalLate = 0;
             intervalSkipped = 0;
+            intervalDrawsWithCollection = 0;
             intervalMaxCost = 0;
             intervalMaxDraw = 0;
             intervalMaxFinish = 0;
