@@ -58,6 +58,11 @@ namespace osu.Desktop.Raster
         private const double slice_fit_percentile = 0.999;
 
         /// <summary>
+        /// A looser rule, logged beside the one in force but never acted on, to say what relaxing it would allow.
+        /// </summary>
+        private const double slice_fit_loose = 0.99;
+
+        /// <summary>
         /// One in how many frames has its processor time read. Reading it is a system call, which a frame pays for whether or not it is sampled.
         /// </summary>
         private const int cpu_sample_interval = 16;
@@ -65,7 +70,28 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// How long more frame slices have to keep fitting before refreshes are split into them, so tear lines don't hop between counts.
         /// </summary>
-        private const long slice_raise_delay_ns = 2_000_000_000;
+        /// <remarks>
+        /// Measured in play, the count in use sat a whole slice below what the frame times allowed for half of every
+        /// second, so this is shorter than the two seconds it began as. Both this and <see cref="slice_fit_grace_ns"/>
+        /// can be set for a play, since what they cost is latency and what they buy is steady tear lines.
+        /// </remarks>
+        private static readonly long slice_raise_delay_ns = envMilliseconds(@"OSU_RASTER_SLICE_RAISE_MS", 1_000);
+
+        /// <summary>
+        /// How long the higher count has to stop fitting before the wait for it starts over.
+        /// </summary>
+        /// <remarks>
+        /// Without this, one present that failed to qualify threw away the whole wait, so a higher count had to fit on
+        /// every one of the roughly nine hundred presents in two seconds without a single miss. A dip now only pauses it.
+        /// </remarks>
+        private static readonly long slice_fit_grace_ns = envMilliseconds(@"OSU_RASTER_SLICE_GRACE_MS", 250);
+
+        private static long envMilliseconds(string name, long fallback)
+        {
+            long ms = long.TryParse(Environment.GetEnvironmentVariable(name), out long parsed) && parsed >= 0 ? parsed : fallback;
+
+            return ms * 1_000_000;
+        }
 
         /// <summary>
         /// How much of a slice a frame has to fit inside before more slices are used. A count that only just fits would be dropped again by the next slow frame.
@@ -183,6 +209,7 @@ namespace osu.Desktop.Raster
         private bool betweenPending;
         private int sliceCount = 1;
         private long moreSlicesFitSince;
+        private long moreSlicesFailedAt;
         private bool planned;
         private DrmVBlankClock.Timing? plannedTiming;
         private long plannedTarget;
@@ -512,19 +539,36 @@ namespace osu.Desktop.Raster
             {
                 sliceCount = fits;
                 moreSlicesFitSince = 0;
+                moreSlicesFailedAt = 0;
             }
             else if (fitsWithRoom > sliceCount)
             {
+                long now = Native.MonotonicNs();
+
+                moreSlicesFailedAt = 0;
+
                 if (moreSlicesFitSince == 0)
-                    moreSlicesFitSince = Native.MonotonicNs();
-                else if (Native.MonotonicNs() - moreSlicesFitSince >= slice_raise_delay_ns)
+                    moreSlicesFitSince = now;
+                else if (now - moreSlicesFitSince >= slice_raise_delay_ns)
                 {
                     sliceCount = fitsWithRoom;
                     moreSlicesFitSince = 0;
                 }
             }
-            else
-                moreSlicesFitSince = 0;
+            else if (moreSlicesFitSince != 0)
+            {
+                // The higher count has stopped fitting. Waiting a moment before throwing away the wait keeps a single
+                // slow present from costing the seconds already served, which is what held the count below what it fit.
+                long now = Native.MonotonicNs();
+
+                if (moreSlicesFailedAt == 0)
+                    moreSlicesFailedAt = now;
+                else if (now - moreSlicesFailedAt >= slice_fit_grace_ns)
+                {
+                    moreSlicesFitSince = 0;
+                    moreSlicesFailedAt = 0;
+                }
+            }
 
             return sliceCount;
         }
@@ -549,7 +593,7 @@ namespace osu.Desktop.Raster
         /// </summary>
         private void logSliceCountChange(DrmVBlankClock.Timing timing, int from, int to, long frameNs, long headroom)
         {
-            string rule = to > from ? $" More slices are only used once a frame fits in {slice_raise_fit:0%} of one, for {slice_raise_delay_ns / 1_000_000_000} seconds." : string.Empty;
+            string rule = to > from ? $" More slices are only used once a frame fits in {slice_raise_fit:0%} of one, for {slice_raise_delay_ns / 1_000_000} ms." : string.Empty;
 
             Logger.Log($"Raster sync: {from} → {to} frame slices per refresh (up to {slices}). A slice at {to} lasts {ms(timing.PeriodNs / to)} ms, "
                        + $"and all but the slowest {1 - slice_fit_percentile:0.0%} of frames need {ms(frameNs)} ms: render {ms(renderCosts.Percentile(slice_fit_percentile))} ms "
@@ -727,6 +771,10 @@ namespace osu.Desktop.Raster
                 double lateFraction = (double)intervalLate / intervalPresents;
                 long margin = renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs);
 
+                // What a looser fit rule would have allowed, to size the next change without risking a skipped slice on this one.
+                long looseFrameNs = renderCosts.Percentile(slice_fit_loose) + Interlocked.Read(ref headroomNs) + betweenPresents.Percentile(slice_fit_loose);
+                long looseFits = plannedTiming == null ? 0 : Math.Clamp(plannedTiming.PeriodNs / Math.Max(1, looseFrameNs), 1, Math.Max(1, slices));
+
                 int gen0 = GC.CollectionCount(0) - intervalGen0;
                 int gen1 = GC.CollectionCount(1) - intervalGen1;
                 int gen2 = GC.CollectionCount(2) - intervalGen2;
@@ -742,7 +790,9 @@ namespace osu.Desktop.Raster
                 Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late ({lateFraction:0.0%}, aiming for {late_target:0%}), "
                            + $"{overtaken} of {flips + overtaken} timed frames overtaken, GC {gen0}/{gen1}/{gen2}. "
                            + $"Frames start {ms(margin)} ms before their scanline (render at the {costPercentile:0.0%} percentile, headroom {ms(Interlocked.Read(ref headroomNs))} ms). "
-                           + $"All but the slowest {1 - slice_fit_percentile:0.0%} of frames need {ms(lastSlowFrameNs)} ms, which fits {lastFits} slices.");
+                           + $"All but the slowest {1 - slice_fit_percentile:0.0%} of frames need {ms(lastSlowFrameNs)} ms, which fits {lastFits} slices"
+                           + $" (at {1 - slice_fit_loose:0%} it would be {ms(looseFrameNs)} ms and {looseFits} slices), "
+                           + $"raising after {slice_raise_delay_ns / 1_000_000} ms with {slice_fit_grace_ns / 1_000_000} ms of grace.");
 
                 Logger.Log($"Raster sync times, milliseconds at p50/p99/max: render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(fixed_percentile))}/{ms(intervalMaxCost)} "
                            + $"= draw {ms(draws.Percentile(0.5))}/{ms(draws.Percentile(fixed_percentile))}/{ms(intervalMaxDraw)} "
