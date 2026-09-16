@@ -565,8 +565,10 @@ namespace osu.Desktop.Raster
             long now = Native.MonotonicNs();
             long target = anchor + ceilingDivide(now + cost - anchor, slice) * slice;
 
-            // A frame that finished early would otherwise tear into the slice the previous frame went to.
-            if (target - lastTarget < slice / 2)
+            // A frame that finished early would otherwise tear into the slice the previous frame went to. Measured from the last slice's
+            // present rather than the cursor's, which tears between slices: with one tear line a refresh, half a refresh from the cursor's
+            // present pushed the blanking interval's present back a whole refresh whenever the cursor was in the lower half of the screen.
+            if (target - lastGridTarget < slice / 2 || target <= lastTarget)
                 target += slice;
 
             bool forCursor = false;
