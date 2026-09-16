@@ -65,7 +65,12 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// What a collection is expected to take, and so what a present gives up to hold one.
         /// </summary>
-        public long ExpectedPauseNs => Math.Min(max_reserve_ns, timedPauses > 0 ? pauses.Percentile(0.99) : assumed_pause_ns);
+        /// <remarks>
+        /// The median rather than a high percentile. Reserving for the worst collection gives up slices on every one of
+        /// them — measured at 3.3 slices a collection where one was meant — while reserving for the typical collection
+        /// costs nothing at all until one runs long, and then only starts that single frame late.
+        /// </remarks>
+        public long ExpectedPauseNs => Math.Min(max_reserve_ns, timedPauses > 0 ? pauses.Percentile(0.5) : assumed_pause_ns);
 
         /// <summary>
         /// The collections forced since this was last read.
