@@ -22,6 +22,11 @@ namespace osu.Desktop.Raster
     /// </summary>
     internal class RasterSyncLinuxGameHost : DesktopGameHost
     {
+        /// <summary>
+        /// How long to wait for the GPU to finish a frame before presenting it regardless. Long enough that only a wedged GPU reaches it.
+        /// </summary>
+        private const long gpu_wait_timeout_ns = 1_000_000_000;
+
         public readonly RasterSyncController RasterSync;
 
         private static readonly MethodInfo? update_frame_sync_mode = typeof(GameHost).GetMethod("updateFrameSyncMode", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -133,8 +138,13 @@ namespace osu.Desktop.Raster
             }
 
             // The compositor waits for the GPU to finish a buffer before flipping it, so the wait for the scanline starts once it has.
+            // A fence covers this frame's commands alone, where glFinish waits for everything the context still has outstanding.
+            IntPtr fence = GL.FenceSync(SyncCondition.SyncGpuCommandsComplete, WaitSyncFlags.None);
+
             RasterSync.NoteDrawFinished();
-            GL.Finish();
+
+            GL.ClientWaitSync(fence, ClientWaitSyncFlags.SyncFlushCommandsBit, gpu_wait_timeout_ns);
+            GL.DeleteSync(fence);
 
             RasterSync.WaitForPlannedPresent();
             base.Swap();
