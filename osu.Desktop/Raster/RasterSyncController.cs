@@ -27,9 +27,29 @@ namespace osu.Desktop.Raster
         private const int cost_history = 1024;
 
         /// <summary>
-        /// The fraction of recent presents the render time prediction covers. Frames slower than that finish late and present straight away.
+        /// The fraction of recent presents the prediction covers before it has watched any finish late.
         /// </summary>
-        private const double cost_percentile = 0.99;
+        private const double cost_percentile_initial = 0.99;
+
+        /// <summary>
+        /// The share of presents allowed to finish after their scanline. Frames are drawn as late as that allows, so the scene they show is as new as possible.
+        /// </summary>
+        private const double late_target = 0.02;
+
+        private const double cost_percentile_step_up = 0.01;
+        private const double cost_percentile_step_down = 0.005;
+        private const double cost_percentile_min = 0.8;
+        private const double cost_percentile_max = 0.999;
+
+        /// <summary>
+        /// Presents an interval needs before its late presents move the prediction.
+        /// </summary>
+        private const int cost_adjust_min_presents = 100;
+
+        /// <summary>
+        /// The fraction of recent presents covered by the predictions that are not steered by how many finish late.
+        /// </summary>
+        private const double fixed_percentile = 0.99;
 
         /// <summary>
         /// How long more frame slices have to keep fitting before refreshes are split into them, so tear lines don't hop between counts.
@@ -101,6 +121,7 @@ namespace osu.Desktop.Raster
         /// </summary>
         private readonly DurationWindow timingErrors = new DurationWindow(cost_history);
 
+        private double costPercentile = cost_percentile_initial;
         private bool betweenPending;
         private int sliceCount = 1;
         private long moreSlicesFitSince;
@@ -128,6 +149,9 @@ namespace osu.Desktop.Raster
         private long intervalMaxSwap;
         private long intervalMaxBetween;
         private long intervalMaxError;
+        private int intervalGen0;
+        private int intervalGen1;
+        private int intervalGen2;
 
         // Counted on the probe thread, read and reset on the draw thread.
         private int intervalFlips;
@@ -277,7 +301,7 @@ namespace osu.Desktop.Raster
                 betweenPending = false;
             }
 
-            long renderNs = renderCosts.Percentile(cost_percentile);
+            long renderNs = renderCosts.Percentile(costPercentile);
             long headroom = Interlocked.Read(ref headroomNs);
             long cost = renderNs + headroom;
 
@@ -286,7 +310,7 @@ namespace osu.Desktop.Raster
 
             if (mode == RasterSyncMode.FrameSlices)
             {
-                count = chooseSliceCount(timing, cost + betweenPresents.Percentile(cost_percentile));
+                count = chooseSliceCount(timing, cost + betweenPresents.Percentile(fixed_percentile));
 
                 if (count != previousCount)
                     logSliceCountChange(timing, previousCount, count, renderNs, headroom);
@@ -363,17 +387,32 @@ namespace osu.Desktop.Raster
         }
 
         /// <summary>
+        /// Moves the render time prediction towards the one that leaves <see cref="late_target"/> of presents finishing late. Draw thread.
+        /// </summary>
+        /// <remarks>
+        /// The prediction decides how long before its scanline a frame starts drawing, and a frame shows the scene as it was when it started.
+        /// Predicting the slowest frames would hold every frame back to the speed of the slowest, so the prediction is pushed down until frames start finishing late.
+        /// </remarks>
+        private void adjustCostPercentile(double lateFraction)
+        {
+            if (lateFraction > late_target)
+                costPercentile = Math.Min(cost_percentile_max, costPercentile + cost_percentile_step_up);
+            else if (lateFraction < late_target / 2)
+                costPercentile = Math.Max(cost_percentile_min, costPercentile - cost_percentile_step_down);
+        }
+
+        /// <summary>
         /// Logs where a frame's time went when the slice count changes, since that decides how many slices fit. Draw thread.
         /// </summary>
         private void logSliceCountChange(DrmVBlankClock.Timing timing, int from, int to, long renderNs, long headroom)
         {
-            long between = betweenPresents.Percentile(cost_percentile);
+            long between = betweenPresents.Percentile(fixed_percentile);
             string rule = to > from ? $" More slices are only used once a frame fits in {slice_raise_fit:0%} of one, for {slice_raise_delay_ns / 1_000_000_000} seconds." : string.Empty;
 
             Logger.Log($"Raster sync: {from} → {to} frame slices per refresh (up to {slices}). A slice at {to} lasts {ms(timing.PeriodNs / to)} ms, "
-                       + $"and a frame needs {ms(renderNs + headroom + between)} ms: render {ms(renderNs)} ms, headroom {ms(headroom)} ms, "
-                       + $"and {ms(between)} ms from one swap to planning the next (swap call {ms(swapCalls.Percentile(cost_percentile))} ms, "
-                       + $"rest of the frame loop {ms(frameLoops.Percentile(cost_percentile))} ms). Durations are 99th percentiles of the last {cost_history} presents.{rule}");
+                       + $"and a frame needs {ms(renderNs + headroom + between)} ms: render {ms(renderNs)} ms at the {costPercentile:0.0%} percentile, headroom {ms(headroom)} ms, "
+                       + $"and {ms(between)} ms from one swap to planning the next (swap call {ms(swapCalls.Percentile(fixed_percentile))} ms, "
+                       + $"rest of the frame loop {ms(frameLoops.Percentile(fixed_percentile))} ms).{rule}");
         }
 
         /// <summary>
@@ -493,23 +532,33 @@ namespace osu.Desktop.Raster
                 int flips = Interlocked.Exchange(ref intervalFlips, 0);
                 int overtaken = Interlocked.Exchange(ref intervalOvertaken, 0);
                 double presentsPerSecond = intervalPresents * 1e9 / (end - intervalStart);
+                double lateFraction = (double)intervalLate / intervalPresents;
+
+                int gen0 = GC.CollectionCount(0) - intervalGen0;
+                int gen1 = GC.CollectionCount(1) - intervalGen1;
+                int gen2 = GC.CollectionCount(2) - intervalGen2;
 
                 string slicesText = mode == RasterSyncMode.FrameSlices ? $"{sliceCount} of up to {slices} slices per refresh, {intervalSkipped} slices skipped, " : string.Empty;
                 string overtakenText = flips + overtaken > 0 ? $", {overtaken} of {flips + overtaken} timed frames overtaken by the next before they flipped" : string.Empty;
 
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
-                         + $"render {ms(renderCosts.Percentile(cost_percentile))} ms at the 99th percentile and up to {ms(intervalMaxCost)} ms, "
+                         + $"frames start {ms(renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs))} ms before their scanline, "
                          + $"{intervalLate} late, {intervalMaxError / 1e3:0} µs present timing error, swap call up to {ms(intervalMaxSwap)} ms{overtakenText}";
 
                 // The runtime log keeps what the status note shows, to line up with recordings of the screen afterwards.
-                Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late, "
-                           + $"{overtaken} of {flips + overtaken} timed frames overtaken. Milliseconds at p50/p99/max: "
-                           + $"render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(cost_percentile))}/{ms(intervalMaxCost)}, "
-                           + $"swap call {ms(swapCalls.Percentile(0.5))}/{ms(swapCalls.Percentile(cost_percentile))}/{ms(intervalMaxSwap)}, "
-                           + $"rest of the frame loop {ms(frameLoops.Percentile(0.5))}/{ms(frameLoops.Percentile(cost_percentile))}, "
-                           + $"swap to next plan {ms(betweenPresents.Percentile(0.5))}/{ms(betweenPresents.Percentile(cost_percentile))}/{ms(intervalMaxBetween)}, "
-                           + $"present timing error {ms(timingErrors.Percentile(0.5))}/{ms(timingErrors.Percentile(cost_percentile))}/{ms(intervalMaxError)}, "
-                           + $"headroom {ms(Interlocked.Read(ref headroomNs))}");
+                Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late ({lateFraction:0.0%}, aiming for {late_target:0%}), "
+                           + $"{overtaken} of {flips + overtaken} timed frames overtaken, GC {gen0}/{gen1}/{gen2}. "
+                           + $"Frames start {ms(renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs))} ms before their scanline "
+                           + $"(render at the {costPercentile:0.0%} percentile, headroom {ms(Interlocked.Read(ref headroomNs))} ms). Milliseconds at p50/p99/max: "
+                           + $"render {ms(renderCosts.Percentile(0.5))}/{ms(renderCosts.Percentile(fixed_percentile))}/{ms(intervalMaxCost)}, "
+                           + $"swap call {ms(swapCalls.Percentile(0.5))}/{ms(swapCalls.Percentile(fixed_percentile))}/{ms(intervalMaxSwap)}, "
+                           + $"rest of the frame loop {ms(frameLoops.Percentile(0.5))}/{ms(frameLoops.Percentile(fixed_percentile))}, "
+                           + $"swap to next plan {ms(betweenPresents.Percentile(0.5))}/{ms(betweenPresents.Percentile(fixed_percentile))}/{ms(intervalMaxBetween)}, "
+                           + $"present timing error {ms(timingErrors.Percentile(0.5))}/{ms(timingErrors.Percentile(fixed_percentile))}/{ms(intervalMaxError)}");
+
+                // Steered from a whole interval, so a single slow frame doesn't hold every later frame back.
+                if (intervalPresents >= cost_adjust_min_presents)
+                    adjustCostPercentile(lateFraction);
 
                 startInterval(end);
             }
@@ -530,6 +579,9 @@ namespace osu.Desktop.Raster
             intervalMaxSwap = 0;
             intervalMaxBetween = 0;
             intervalMaxError = 0;
+            intervalGen0 = GC.CollectionCount(0);
+            intervalGen1 = GC.CollectionCount(1);
+            intervalGen2 = GC.CollectionCount(2);
             Interlocked.Exchange(ref intervalFlips, 0);
             Interlocked.Exchange(ref intervalOvertaken, 0);
         }
