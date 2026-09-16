@@ -236,12 +236,15 @@ namespace osu.Desktop.Raster
         /// </summary>
         public readonly UpdateSync UpdateSync = new UpdateSync();
 
-#if RASTER_METRICS
         /// <summary>
-        /// Draws the gameplay cursor at the newest pen report, if it was installed. Only measured from here.
+        /// From starting a cursor draw held until the rest of the frame had finished on the GPU, to that draw finishing on the GPU too.
         /// </summary>
-        public PenLatch? PenLatch;
-#endif
+        private readonly DurationWindow lateDraws = new DurationWindow(cost_history);
+
+        /// <summary>
+        /// Whether the last present drew a held cursor, so the next is planned with time for one.
+        /// </summary>
+        private bool lastPresentDrewLate;
 
 #if RASTER_METRICS
         // What the slice count was last decided on. Logged every second, since a count that keeps falling back is
@@ -339,6 +342,8 @@ namespace osu.Desktop.Raster
         private int intervalGen0;
         private int intervalGen1;
         private int intervalGen2;
+        private int intervalLateDraws;
+        private long intervalMaxLateDraw;
 #endif
 
         // Counted on the probe thread, read and reset on the draw thread.
@@ -499,7 +504,9 @@ namespace osu.Desktop.Raster
             // A collection that is due is paid for by this present: adding it to the cost aims the present at a later
             // slice, which leaves the gap before the frame starts drawing long enough to collect in.
             long reserved = gcPacer.Reserve();
-            long cost = renderNs + headroom + reserved;
+            // A cursor held until the frame has finished is drawn inside the wait for the scanline, so the frame starts that much earlier.
+            long lateNs = lastPresentDrewLate ? lateDraws.Percentile(costPercentile) : 0;
+            long cost = renderNs + lateNs + headroom + reserved;
 
             int previousCount = sliceCount;
             int count = 1;
@@ -508,7 +515,8 @@ namespace osu.Desktop.Raster
             {
                 // Frames that overrun a slice leave the next one without a frame of its own, which shows as uneven pacing rather than latency,
                 // so the count is decided on a stricter percentile than the margin a frame starts on.
-                long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + headroom + betweenPresents.Percentile(slice_fit_percentile);
+                long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + (lastPresentDrewLate ? lateDraws.Percentile(slice_fit_percentile) : 0)
+                                   + headroom + betweenPresents.Percentile(slice_fit_percentile);
 
                 count = chooseSliceCount(timing, slowFrameNs);
 
@@ -759,7 +767,34 @@ namespace osu.Desktop.Raster
 
             armProbe();
 
-            if (ready < plannedTarget)
+            long now = ready;
+            var latch = host.PenLatch;
+
+            lastPresentDrewLate = latch?.HasDeferredDraw == true;
+
+            if (lastPresentDrewLate)
+            {
+                // The held cursor is drawn as close to the scanline as its own draw allows, so it takes the newest pen report there is.
+                long lateStart = plannedTarget - lateDraws.Percentile(costPercentile);
+
+                if (ready < lateStart)
+                    Native.WaitUntil(lateStart, spin_window_ns);
+
+                long drawStart = Native.MonotonicNs();
+
+                latch!.DrawDeferred(host.Renderer);
+                host.FinishOnGpu();
+
+                now = Native.MonotonicNs();
+                lateDraws.Add(now - drawStart);
+
+#if RASTER_METRICS
+                intervalLateDraws++;
+                intervalMaxLateDraw = Math.Max(intervalMaxLateDraw, now - drawStart);
+#endif
+            }
+
+            if (now < plannedTarget)
             {
                 Native.WaitUntil(plannedTarget, spin_window_ns);
                 presentStart = Native.MonotonicNs();
@@ -774,7 +809,7 @@ namespace osu.Desktop.Raster
             else
             {
                 // Present straight away. The tear line lands late this once, which beats holding the frame for another slice.
-                presentStart = ready;
+                presentStart = now;
                 intervalLate++;
             }
 
@@ -783,7 +818,7 @@ namespace osu.Desktop.Raster
             intervalCollectionsWaiting += presentCollections - readyCollections;
 
             UpdateSync.NotePresent(presentStart);
-            PenLatch?.NotePresent(presentStart);
+            host.PenLatch?.NotePresent(presentStart);
 #endif
             probe?.NoteSwap(presentStart);
 
@@ -911,8 +946,11 @@ namespace osu.Desktop.Raster
 
                 Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart));
 
-                if (PenLatch != null)
-                    Logger.Log(PenLatch.TakeIntervalSummary());
+                if (host.PenLatch != null)
+                {
+                    Logger.Log(host.PenLatch.TakeIntervalSummary()
+                               + $" {intervalLateDraws} were drawn after the rest of the frame finished, taking {ms(lateDraws.Percentile(0.5))}/{ms(lateDraws.Percentile(fixed_percentile))}/{ms(intervalMaxLateDraw)} ms at p50/p99/max.");
+                }
 #else
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
                          + $"frames start {ms(margin)} ms before their scanline, {intervalLate} late{overtakenText}";
@@ -1011,6 +1049,8 @@ namespace osu.Desktop.Raster
             intervalGen0 = GC.CollectionCount(0);
             intervalGen1 = GC.CollectionCount(1);
             intervalGen2 = GC.CollectionCount(2);
+            intervalLateDraws = 0;
+            intervalMaxLateDraw = 0;
 #endif
             Interlocked.Exchange(ref intervalFlips, 0);
             Interlocked.Exchange(ref intervalOvertaken, 0);

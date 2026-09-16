@@ -54,12 +54,7 @@ namespace osu.Desktop.Raster
         public PenLatch? InstallPenLatch()
         {
             if (PenLatch == null)
-            {
                 PenLatch = PenLatch.TryInstall(AvailableInputHandlers);
-#if RASTER_METRICS
-                RasterSync.PenLatch = PenLatch;
-#endif
-            }
 
             return PenLatch;
         }
@@ -125,6 +120,7 @@ namespace osu.Desktop.Raster
         {
             if (!RasterSync.ShouldPace(findBlocker()))
             {
+                PenLatch?.BeginFrame(false);
                 base.DrawFrame();
                 return;
             }
@@ -132,12 +128,14 @@ namespace osu.Desktop.Raster
             if (executionMode.Value == ExecutionMode.SingleThread)
             {
                 // Input, audio and update frames run on this thread right after this draw frame, so the wait for the next present goes last.
+                PenLatch?.BeginFrame(false);
                 base.DrawFrame();
                 RasterSync.PlanNextPresent();
             }
             else
             {
                 RasterSync.PlanNextPresent();
+                PenLatch?.BeginFrame(RasterSync.HasPlannedPresent);
                 base.DrawFrame();
             }
         }
@@ -164,25 +162,36 @@ namespace osu.Desktop.Raster
         {
             if (!RasterSync.HasPlannedPresent)
             {
+                // Nothing is held without a timed present, but a draw handed over regardless must not outlive the frame's state.
+                if (PenLatch?.HasDeferredDraw == true)
+                    PenLatch.DrawDeferred(Renderer);
+
                 base.Swap();
                 RasterSync.CountPresent();
                 return;
             }
 
             // The compositor waits for the GPU to finish a buffer before flipping it, so the wait for the scanline starts once it has.
-            // A fence covers this frame's commands alone, where glFinish waits for everything the context still has outstanding.
-            IntPtr fence = GL.FenceSync(SyncCondition.SyncGpuCommandsComplete, WaitSyncFlags.None);
-
 #if RASTER_METRICS
             RasterSync.NoteDrawFinished();
 #endif
 
-            GL.ClientWaitSync(fence, ClientWaitSyncFlags.SyncFlushCommandsBit, gpu_wait_timeout_ns);
-            GL.DeleteSync(fence);
+            FinishOnGpu();
 
             RasterSync.WaitForPlannedPresent();
             base.Swap();
             RasterSync.CompletePresent();
+        }
+
+        /// <summary>
+        /// Waits for the GPU to finish what has been drawn so far. A fence covers this frame's commands alone, where glFinish waits for everything the context still has outstanding.
+        /// </summary>
+        public void FinishOnGpu()
+        {
+            IntPtr fence = GL.FenceSync(SyncCondition.SyncGpuCommandsComplete, WaitSyncFlags.None);
+
+            GL.ClientWaitSync(fence, ClientWaitSyncFlags.SyncFlushCommandsBit, gpu_wait_timeout_ns);
+            GL.DeleteSync(fence);
         }
 
         protected override void Dispose(bool isDisposing)
