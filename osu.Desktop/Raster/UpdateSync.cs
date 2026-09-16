@@ -18,6 +18,11 @@ namespace osu.Desktop.Raster
     /// The update thread's clock is sampled after <c>UpdateFrame</c> returns, when <c>GameThread</c> processes its clock, and input is
     /// collected inside the next one. The wait therefore goes at the end of <c>UpdateFrame</c>: time and input are both read after it.
     /// </remarks>
+    /// <remarks>
+    /// Off by default. Measured on one map, timing update frames made scenes older rather than newer: 1.61 ms at present against 1.26 ms
+    /// running free. Frames were aimed to finish in time at their slowest percent, so the typical one finished half a millisecond early,
+    /// and frames woken from a sleep ran slower. Running free, a scene only sat 0.17 ms before the draw woke, which is all this could ever recover.
+    /// </remarks>
     internal sealed class UpdateSync
     {
         public enum SyncMode
@@ -41,9 +46,9 @@ namespace osu.Desktop.Raster
 
         public static readonly SyncMode MODE = Environment.GetEnvironmentVariable(@"OSU_RASTER_UPDATE_SYNC")?.ToLowerInvariant() switch
         {
-            @"off" or @"0" => SyncMode.Off,
+            @"fill" => SyncMode.Fill,
             @"aligned" => SyncMode.Aligned,
-            _ => SyncMode.Fill,
+            _ => SyncMode.Off,
         };
 
         /// <summary>
@@ -72,12 +77,14 @@ namespace osu.Desktop.Raster
         private long planWake;
         private long planSlice;
 
+#if RASTER_METRICS
         // Written on the update thread, read on the draw thread. A published frame's times sit in the slot its number picks,
         // and stay readable until four more frames have been published.
         private const int slot_count = 4;
         private readonly long[] frameStarts = new long[slot_count];
         private readonly long[] frameEnds = new long[slot_count];
         private long publishedFrame;
+#endif
         private int updatesAligned;
         private int updatesFilled;
         private long estimateNs;
@@ -89,6 +96,7 @@ namespace osu.Desktop.Raster
         private int framesSinceEstimate;
         private bool timerSlackSet;
 
+#if RASTER_METRICS
         // Draw thread only.
         private readonly DurationWindow drawnUpdateFrames = new DurationWindow(history);
         private readonly DurationWindow agesAtDraw = new DurationWindow(history);
@@ -105,6 +113,7 @@ namespace osu.Desktop.Raster
         private int intervalWaited;
         private long intervalUpdatesPerDraw;
         private long intervalMaxAgeAtPresent;
+#endif
 
         /// <summary>
         /// Update thread, at the end of <c>UpdateFrame</c> once the scene it built has been published.
@@ -112,14 +121,22 @@ namespace osu.Desktop.Raster
         /// <param name="mayWait">Whether this thread is only updating. With a single thread, waiting here would hold up the draw too.</param>
         public void FinishUpdateFrame(bool mayWait)
         {
+#if !RASTER_METRICS
+            if (MODE == SyncMode.Off)
+                return;
+#endif
+
             long end = Native.MonotonicNs();
-            long frame = publishedFrame + 1;
 
             if (frameStart > 0)
             {
+#if RASTER_METRICS
+                long frame = publishedFrame + 1;
+
                 frameStarts[frame & (slot_count - 1)] = frameStart;
                 frameEnds[frame & (slot_count - 1)] = end;
                 Volatile.Write(ref publishedFrame, frame);
+#endif
 
                 updateFrames.Add(end - frameStart);
 
@@ -188,10 +205,13 @@ namespace osu.Desktop.Raster
         public void ClearPlan()
         {
             Volatile.Write(ref planWake, 0);
+#if RASTER_METRICS
             lastDrawnFrame = -1;
             drawnFrameKnown = false;
+#endif
         }
 
+#if RASTER_METRICS
         /// <summary>
         /// Draw thread, on waking to draw. The draw takes the newest scene published by then, or waits for the next if it has drawn that one already.
         /// </summary>
@@ -291,5 +311,6 @@ namespace osu.Desktop.Raster
         }
 
         private static string ms(long ns) => $"{ns / 1e6:0.000}";
+#endif
     }
 }

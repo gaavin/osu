@@ -168,10 +168,11 @@ namespace osu.Desktop.Raster
         // Draw thread only.
 
         /// <summary>
-        /// From the draw thread waking to the frame being finished on the GPU: <see cref="draws"/>, then <see cref="gpuFinishes"/>.
+        /// From the draw thread waking to the frame being finished on the GPU: the draw, then the wait for the GPU.
         /// </summary>
         private readonly DurationWindow renderCosts = new DurationWindow(cost_history);
 
+#if RASTER_METRICS
         /// <summary>
         /// The draw thread's own work on a frame, up to the point the GPU is asked to finish it.
         /// </summary>
@@ -199,12 +200,14 @@ namespace osu.Desktop.Raster
         /// How long past the moment a frame had to start drawing the draw thread actually woke, which eats the same margin as a slow frame.
         /// </summary>
         private readonly DurationWindow wakeOvershoots = new DurationWindow(cost_history);
+#endif
 
         /// <summary>
-        /// From starting one timed swap to planning the next present: <see cref="swapCalls"/>, then <see cref="frameLoops"/>.
+        /// From starting one timed swap to planning the next present: the swap call, then the rest of the frame loop.
         /// </summary>
         private readonly DurationWindow betweenPresents = new DurationWindow(cost_history);
 
+#if RASTER_METRICS
         private readonly DurationWindow swapCalls = new DurationWindow(cost_history);
 
         /// <summary>
@@ -221,6 +224,7 @@ namespace osu.Desktop.Raster
         /// What the runtime says each ephemeral collection cost, sampled once per collection rather than once per present.
         /// </summary>
         private readonly DurationWindow gcPauses = new DurationWindow(cost_history);
+#endif
 
         /// <summary>
         /// Holds collections until a present has set time aside for one.
@@ -232,10 +236,12 @@ namespace osu.Desktop.Raster
         /// </summary>
         public readonly UpdateSync UpdateSync = new UpdateSync();
 
+#if RASTER_METRICS
         // What the slice count was last decided on. Logged every second, since a count that keeps falling back is
         // otherwise only visible at the moment it changes.
         private long lastSlowFrameNs;
         private int lastFits;
+#endif
 
         private double costPercentile = cost_percentile_initial;
         private bool betweenPending;
@@ -250,6 +256,7 @@ namespace osu.Desktop.Raster
         private long lastTarget;
         private double? steeredOffset;
         private long wakeTime;
+#if RASTER_METRICS
         private long wakeCpuTime;
         private int planCollections;
         private int wakeCollections;
@@ -260,8 +267,9 @@ namespace osu.Desktop.Raster
         private int drawEndCollections;
         private int readyCollections;
         private int presentCollections;
-        private long presentStart;
         private long swapEnd;
+#endif
+        private long presentStart;
         private bool timerSlackSet;
         private string? blockedBy = "Off";
 
@@ -274,6 +282,7 @@ namespace osu.Desktop.Raster
         private int intervalLate;
         private int intervalSkipped;
 
+#if RASTER_METRICS
         /// <summary>
         /// Slices deliberately given up so that a collection had somewhere to run, which are not uneven pacing.
         /// </summary>
@@ -289,9 +298,13 @@ namespace osu.Desktop.Raster
         private int intervalCollectionsWaiting;
         private int intervalCollectionsSwapping;
 
+#endif
+
         private int lastCollections;
         private long gcIndex;
         private long gcAllocated;
+
+#if RASTER_METRICS
         private long intervalGcBytes;
         private int intervalGcSamples;
 
@@ -301,10 +314,14 @@ namespace osu.Desktop.Raster
         private long intervalPauseTotal;
         private long intervalPauseMax;
 
+#endif
+
         /// <summary>
         /// The most recent gap between collections, reported in the seconds that saw none of their own.
         /// </summary>
         private long lastGcBytes;
+
+#if RASTER_METRICS
         private long intervalMaxCost;
         private long intervalMaxDraw;
         private long intervalMaxFinish;
@@ -315,6 +332,7 @@ namespace osu.Desktop.Raster
         private int intervalGen0;
         private int intervalGen1;
         private int intervalGen2;
+#endif
 
         // Counted on the probe thread, read and reset on the draw thread.
         private int intervalFlips;
@@ -461,8 +479,10 @@ namespace osu.Desktop.Raster
                 long planStart = Native.MonotonicNs();
 
                 betweenPresents.Add(planStart - presentStart);
+#if RASTER_METRICS
                 frameLoops.Add(planStart - swapEnd);
                 intervalMaxBetween = Math.Max(intervalMaxBetween, planStart - presentStart);
+#endif
                 betweenPending = false;
             }
 
@@ -483,11 +503,14 @@ namespace osu.Desktop.Raster
                 // so the count is decided on a stricter percentile than the margin a frame starts on.
                 long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + headroom + betweenPresents.Percentile(slice_fit_percentile);
 
-                lastSlowFrameNs = slowFrameNs;
                 count = chooseSliceCount(timing, slowFrameNs);
+
+#if RASTER_METRICS
+                lastSlowFrameNs = slowFrameNs;
 
                 if (count != previousCount)
                     logSliceCountChange(timing, previousCount, count, slowFrameNs, headroom);
+#endif
             }
 
             long slice = timing.PeriodNs / count;
@@ -510,10 +533,12 @@ namespace osu.Desktop.Raster
             {
                 int missed = (int)((target - lastTarget + slice / 2) / slice) - 1;
 
-                if (reserved > 0)
-                    intervalCollectionSkips += missed;
-                else
+                if (reserved == 0)
                     intervalSkipped += missed;
+#if RASTER_METRICS
+                else
+                    intervalCollectionSkips += missed;
+#endif
             }
 
             // Targets are whole slices from the anchor, whose slice is the one at the top of the screen.
@@ -525,18 +550,23 @@ namespace osu.Desktop.Raster
             plannedWake = target - cost;
             planned = true;
 
-            UpdateSync.NotePlan(plannedWake, slice);
+            if (UpdateSync.MODE != UpdateSync.SyncMode.Off)
+                UpdateSync.NotePlan(plannedWake, slice);
 
+#if RASTER_METRICS
             // A collection that runs while the draw thread sleeps costs it nothing: the thread is inside a blocking
             // call, so the runtime suspends it without waiting for it to reach a safe point. Counting those apart
             // from the rest says how much of the collection load is already free, and how much is in the way.
             planCollections = GC.CollectionCount(0);
+#endif
 
             // Inside the sleep window as far as the counters are concerned, which is exactly where it should land.
             gcPacer.CollectIfReserved();
 
             Native.SleepUntil(plannedWake);
             wakeTime = Native.MonotonicNs();
+
+#if RASTER_METRICS
             UpdateSync.NoteWake(wakeTime);
             wakeCollections = GC.CollectionCount(0);
             intervalCollectionsIdle += wakeCollections - planCollections;
@@ -549,6 +579,7 @@ namespace osu.Desktop.Raster
 
             wakeOvershoots.Add(overshoot);
             intervalMaxWake = Math.Max(intervalMaxWake, overshoot);
+#endif
         }
 
         /// <summary>
@@ -569,7 +600,9 @@ namespace osu.Desktop.Raster
 
             int fits = (int)Math.Clamp(timing.PeriodNs / frameNs, 1, most);
 
+#if RASTER_METRICS
             lastFits = fits;
+#endif
             int fitsWithRoom = (int)Math.Clamp((long)(timing.PeriodNs * slice_raise_fit) / frameNs, 1, most);
 
             if (fits < sliceCount)
@@ -625,6 +658,7 @@ namespace osu.Desktop.Raster
                 costPercentile = Math.Max(cost_percentile_min, costPercentile - cost_percentile_step_down);
         }
 
+#if RASTER_METRICS
         /// <summary>
         /// Logs where a frame's time went when the slice count changes, since that decides how many slices fit. Draw thread.
         /// </summary>
@@ -638,6 +672,7 @@ namespace osu.Desktop.Raster
                        + $"and {ms(betweenPresents.Percentile(slice_fit_percentile))} ms from one swap to planning the next "
                        + $"(swap call {ms(swapCalls.Percentile(slice_fit_percentile))} ms, rest of the frame loop {ms(frameLoops.Percentile(slice_fit_percentile))} ms).{rule}");
         }
+#endif
 
         /// <summary>
         /// Moves the tear line towards the offset found from recorded flips, which the play in progress keeps refitting. Draw thread.
@@ -663,12 +698,14 @@ namespace osu.Desktop.Raster
         /// </summary>
         public void NoteDrawFinished()
         {
+#if RASTER_METRICS
             drawEnd = Native.MonotonicNs();
             drawEndCollections = GC.CollectionCount(0);
             UpdateSync.NoteDrawn();
 
             if (samplingCpu)
                 drawEndCpuTime = Native.ThreadCpuNs();
+#endif
         }
 
         /// <summary>
@@ -679,9 +716,10 @@ namespace osu.Desktop.Raster
             long ready = Native.MonotonicNs();
             long cost = ready - wakeTime;
 
-            readyCollections = GC.CollectionCount(0);
-
             renderCosts.Add(cost);
+
+#if RASTER_METRICS
+            readyCollections = GC.CollectionCount(0);
             intervalMaxCost = Math.Max(intervalMaxCost, cost);
 
             if (drawEnd >= wakeTime)
@@ -710,6 +748,7 @@ namespace osu.Desktop.Raster
                 intervalMaxDraw = Math.Max(intervalMaxDraw, draw);
                 intervalMaxFinish = Math.Max(intervalMaxFinish, finish);
             }
+#endif
 
             armProbe();
 
@@ -718,10 +757,12 @@ namespace osu.Desktop.Raster
                 Native.WaitUntil(plannedTarget, spin_window_ns);
                 presentStart = Native.MonotonicNs();
 
+#if RASTER_METRICS
                 long error = Math.Max(0, presentStart - plannedTarget);
 
                 timingErrors.Add(error);
                 intervalMaxError = Math.Max(intervalMaxError, error);
+#endif
             }
             else
             {
@@ -730,10 +771,12 @@ namespace osu.Desktop.Raster
                 intervalLate++;
             }
 
+#if RASTER_METRICS
             presentCollections = GC.CollectionCount(0);
             intervalCollectionsWaiting += presentCollections - readyCollections;
 
             UpdateSync.NotePresent(presentStart);
+#endif
             probe?.NoteSwap(presentStart);
 
             if (probeArmed)
@@ -789,14 +832,16 @@ namespace osu.Desktop.Raster
 
             int endCollections = GC.CollectionCount(0);
 
-            intervalCollectionsSwapping += endCollections - presentCollections;
             sampleCollectionPause(endCollections);
 
+#if RASTER_METRICS
+            intervalCollectionsSwapping += endCollections - presentCollections;
             swapCalls.Add(end - presentStart);
             intervalMaxSwap = Math.Max(intervalMaxSwap, end - presentStart);
+            swapEnd = end;
+#endif
             intervalPresents++;
 
-            swapEnd = end;
             lastTarget = plannedTarget;
             planned = false;
             betweenPending = true;
@@ -810,6 +855,10 @@ namespace osu.Desktop.Raster
                 double lateFraction = (double)intervalLate / intervalPresents;
                 long margin = renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs);
 
+                string slicesText = mode == RasterSyncMode.FrameSlices ? $"{sliceCount} of up to {slices} slices per refresh, {intervalSkipped} slices skipped, " : string.Empty;
+                string overtakenText = flips + overtaken > 0 ? $", {overtaken} of {flips + overtaken} timed frames overtaken by the next before they flipped" : string.Empty;
+
+#if RASTER_METRICS
                 // What a looser fit rule would have allowed, to size the next change without risking a skipped slice on this one.
                 long looseFrameNs = renderCosts.Percentile(slice_fit_loose) + Interlocked.Read(ref headroomNs) + betweenPresents.Percentile(slice_fit_loose);
                 long looseFits = plannedTiming == null ? 0 : Math.Clamp(plannedTiming.PeriodNs / Math.Max(1, looseFrameNs), 1, Math.Max(1, slices));
@@ -817,9 +866,6 @@ namespace osu.Desktop.Raster
                 int gen0 = GC.CollectionCount(0) - intervalGen0;
                 int gen1 = GC.CollectionCount(1) - intervalGen1;
                 int gen2 = GC.CollectionCount(2) - intervalGen2;
-
-                string slicesText = mode == RasterSyncMode.FrameSlices ? $"{sliceCount} of up to {slices} slices per refresh, {intervalSkipped} slices skipped, " : string.Empty;
-                string overtakenText = flips + overtaken > 0 ? $", {overtaken} of {flips + overtaken} timed frames overtaken by the next before they flipped" : string.Empty;
 
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
                          + $"frames start {ms(margin)} ms before their scanline, "
@@ -856,6 +902,10 @@ namespace osu.Desktop.Raster
                            + $"which costs a present {ms(gcPacer.ExpectedPauseNs)} ms against a {gcPacer.BudgetBytes / 1024} KiB budget.");
 
                 Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart));
+#else
+                status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
+                         + $"frames start {ms(margin)} ms before their scanline, {intervalLate} late{overtakenText}";
+#endif
 
                 // Steered from a whole interval, so a single slow frame doesn't hold every later frame back.
                 if (intervalPresents >= cost_adjust_min_presents)
@@ -894,6 +944,7 @@ namespace osu.Desktop.Raster
 
             long pause = info.PauseDurations.Length > 0 ? (long)info.PauseDurations[0].TotalNanoseconds : 0;
 
+#if RASTER_METRICS
             if (pause > 0)
             {
                 gcPauses.Add(pause);
@@ -901,6 +952,7 @@ namespace osu.Desktop.Raster
                 intervalPauseTotal += pause;
                 intervalPauseMax = Math.Max(intervalPauseMax, pause);
             }
+#endif
 
             // What the collection had to be earned by, which is the budget the pacer has to get to first.
             long allocated = GC.GetTotalAllocatedBytes();
@@ -908,8 +960,10 @@ namespace osu.Desktop.Raster
             if (gcAllocated > 0)
             {
                 lastGcBytes = allocated - gcAllocated;
+#if RASTER_METRICS
                 intervalGcBytes += lastGcBytes;
                 intervalGcSamples++;
+#endif
             }
 
             gcAllocated = allocated;
@@ -922,6 +976,7 @@ namespace osu.Desktop.Raster
             intervalPresents = 0;
             intervalLate = 0;
             intervalSkipped = 0;
+#if RASTER_METRICS
             intervalCollectionSkips = 0;
             intervalDrawsWithCollection = 0;
             intervalMaxDrawWithCollection = 0;
@@ -945,6 +1000,7 @@ namespace osu.Desktop.Raster
             intervalGen0 = GC.CollectionCount(0);
             intervalGen1 = GC.CollectionCount(1);
             intervalGen2 = GC.CollectionCount(2);
+#endif
             Interlocked.Exchange(ref intervalFlips, 0);
             Interlocked.Exchange(ref intervalOvertaken, 0);
         }
