@@ -276,10 +276,18 @@ namespace osu.Desktop.Raster
         private static readonly int cursor_tearline_bands = int.TryParse(Environment.GetEnvironmentVariable(@"OSU_CURSOR_TEARLINE_BANDS"), out int bands) && bands >= 0 ? bands : 0;
 
         private bool plannedForCursor;
+        private bool plannedMerged;
         private double plannedCursorLine;
+
+        private double plannedOffset;
 
 #if RASTER_METRICS
         private double lastCursorLine = double.NaN;
+
+        /// <summary>
+        /// How evenly the scene advances in each band of the screen, refresh to refresh, which is what frame pacing looks like with several presents a refresh.
+        /// </summary>
+        private readonly PacingMonitor pacing = new PacingMonitor();
 #endif
         private long lastGridTarget;
         private long lastCursorTarget;
@@ -384,6 +392,7 @@ namespace osu.Desktop.Raster
         private int intervalCursorPresents;
         private int intervalCursorSkips;
         private int intervalCursorOnlyRefreshes;
+        private int intervalMergedPresents;
         private double intervalCursorLineMoves;
         private double intervalMaxCursorLineMove;
         private long intervalMaxLateDraw;
@@ -578,6 +587,7 @@ namespace osu.Desktop.Raster
             // The first tear line of each refresh aims at the middle of the blanking interval, moved by the offset.
             // Further slices follow at even spacing down the screen.
             double offset = steerOffset(timing);
+            plannedOffset = offset;
             double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + offset;
             long anchor = timing.VBlankNs + (long)(tearline * timing.PeriodNs / timing.VTotal);
 
@@ -591,6 +601,7 @@ namespace osu.Desktop.Raster
                 target += slice;
 
             bool forCursor = false;
+            bool merged = false;
 
             // One more tear line each refresh sits just above the cursor, and its present draws the cursor last, so the cursor is scanned out
             // right after the newest pen report is taken. The evenly spaced slices stay where they are, bar any the cursor's present crowds out.
@@ -598,39 +609,69 @@ namespace osu.Desktop.Raster
             if (PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
             {
                 long lateNs = lateDraws.Percentile(costPercentile);
+                double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
                 double line = cursorTop - cursor_tearline_lead;
 
                 if (cursor_tearline_bands > 0)
                 {
-                    double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
                     double band = (double)timing.VTotal / cursor_tearline_bands;
 
                     line = blankingLine + Math.Floor((line - blankingLine) / band) * band;
                 }
 
-                plannedCursorLine = line;
-                line += offset;
-                long cursorBase = timing.VBlankNs + (long)(line * timing.PeriodNs / timing.VTotal);
-                long cursorTarget = cursorBase + ceilingDivide(now + cost + lateNs - cursorBase, timing.PeriodNs) * timing.PeriodNs;
-
-                // Once a refresh.
-                if (cursorTarget - lastCursorTarget < timing.PeriodNs / 2)
-                    cursorTarget += timing.PeriodNs;
-
-                // A slice presented first would have to leave time for another whole frame before the cursor's, or the cursor waits a refresh.
-                long afterSlice = target + betweenPresents.Percentile(costPercentile) + cost + lateNs;
-
-                if (cursorTarget < afterSlice)
+                if (count == 1)
                 {
-                    target = cursorTarget;
+                    // The blanking interval's present is never given up. Measured in play, dropping it whenever the cursor was too close to it for both
+                    // left the top of the screen alternating between frames 1.75 ms apart, refresh to refresh. A cursor low on the screen has its tear
+                    // line pulled up far enough for a whole frame to fit before the blanking interval's, and one high on the screen, which that tear
+                    // line is only just above anyway, has its draw held on the blanking interval's present instead of a present of its own.
+                    double gapLines = (double)(betweenPresents.Percentile(costPercentile) + cost + lateNs) * timing.VTotal / timing.PeriodNs;
+
+                    line = Math.Min(line, blankingLine - gapLines);
+                    merged = line < blankingLine - timing.VTotal + gapLines;
+
+                    if (merged)
+                        line = blankingLine - timing.VTotal;
+                }
+
+                plannedCursorLine = line;
+
+                if (merged)
+                {
+                    target = anchor + ceilingDivide(now + cost + lateNs - anchor, slice) * slice;
+
+                    if (target - lastGridTarget < slice / 2 || target <= lastTarget)
+                        target += slice;
+
                     cost += lateNs;
                     forCursor = true;
+                }
+                else
+                {
+                    line += offset;
+                    long cursorBase = timing.VBlankNs + (long)(line * timing.PeriodNs / timing.VTotal);
+                    long cursorTarget = cursorBase + ceilingDivide(now + cost + lateNs - cursorBase, timing.PeriodNs) * timing.PeriodNs;
+
+                    // Once a refresh.
+                    if (cursorTarget - lastCursorTarget < timing.PeriodNs / 2)
+                        cursorTarget += timing.PeriodNs;
+
+                    // A slice presented first would have to leave time for another whole frame before the cursor's, or the cursor waits a refresh.
+                    // With one tear line a refresh the cursor's has already been placed to leave that time, so whichever comes first goes first.
+                    long afterSlice = count == 1 ? target : target + betweenPresents.Percentile(costPercentile) + cost + lateNs;
+
+                    if (cursorTarget < afterSlice)
+                    {
+                        target = cursorTarget;
+                        cost += lateNs;
+                        forCursor = true;
+                    }
                 }
             }
 
             // Slices left without a frame of their own since the last present. A slice given up to hold a collection, or crowded out by
             // the cursor's present, is counted apart from those, since skipped slices are how uneven pacing shows and these were chosen.
-            if (!forCursor && followsPresent && count == previousCount && target - lastGridTarget > slice * 3 / 2)
+            if ((!forCursor || merged) && followsPresent && count == previousCount && target - lastGridTarget > slice * 3 / 2)
             {
                 int missed = (int)((target - lastGridTarget + slice / 2) / slice) - 1;
 
@@ -653,6 +694,7 @@ namespace osu.Desktop.Raster
             long sliceNumber = (long)Math.Floor((double)(target - anchor) / slice);
             plannedSlice = count > 1 ? (int)((sliceNumber % count + count) % count) : null;
             plannedForCursor = forCursor;
+            plannedMerged = merged;
 
             plannedTiming = timing;
             plannedTarget = target;
@@ -983,6 +1025,13 @@ namespace osu.Desktop.Raster
 #endif
             intervalPresents++;
 
+            bool followsCursorOnly = lastTarget == lastCursorTarget && lastTarget != lastGridTarget;
+
+#if RASTER_METRICS
+            if (plannedTiming != null)
+                pacing.NotePresent(plannedTiming, presentStart, plannedOffset, wakeTime);
+#endif
+
             lastTarget = plannedTarget;
 
             if (plannedForCursor)
@@ -990,8 +1039,11 @@ namespace osu.Desktop.Raster
 #if RASTER_METRICS
                 intervalCursorPresents++;
 
-                // A refresh whose slices all went to the cursor's present, as when the cursor is too close to the blanking interval's tear line for both.
-                if (lastTarget == lastCursorTarget)
+                if (plannedMerged)
+                    intervalMergedPresents++;
+
+                // A refresh whose slices all went to the cursor's present, as when the cursor is too close to a slice's tear line for both.
+                if (followsCursorOnly && !plannedMerged)
                     intervalCursorOnlyRefreshes++;
 
                 if (!double.IsNaN(lastCursorLine))
@@ -1006,7 +1058,8 @@ namespace osu.Desktop.Raster
 #endif
                 lastCursorTarget = plannedTarget;
             }
-            else
+
+            if (!plannedForCursor || plannedMerged)
                 lastGridTarget = plannedTarget;
             planned = false;
             betweenPending = true;
@@ -1067,6 +1120,7 @@ namespace osu.Desktop.Raster
                            + $"which costs a present {ms(gcPacer.ExpectedPauseNs)} ms against a {gcPacer.BudgetBytes / 1024} KiB budget.");
 
                 Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart));
+                Logger.Log(pacing.TakeIntervalSummary());
 
                 if (host.PenLatch != null)
                 {
@@ -1074,7 +1128,7 @@ namespace osu.Desktop.Raster
                                + $" {intervalLateDraws} were drawn after the rest of the frame finished, taking {ms(lateDraws.Percentile(0.5))}/{ms(lateDraws.Percentile(fixed_percentile))}/{ms(intervalMaxLateDraw)} ms at p50/p99/max"
                                + $" (drawing and submitting {ms(lateDrawSubmits.Percentile(0.5))}/{ms(lateDrawSubmits.Percentile(fixed_percentile))}, {(late_draw_waits_for_gpu ? "then waiting for the GPU" : "not waiting for the GPU")})."
                                + $" {intervalCursorPresents} presents tore {cursor_tearline_lead} lines above the cursor, crowding out {intervalCursorSkips} slices,"
-                               + $" and {intervalCursorOnlyRefreshes} followed another of theirs with no slice between."
+                               + $" and {intervalCursorOnlyRefreshes} followed another of theirs with no slice between, while {intervalMergedPresents} shared a slice's present."
                                + $" Their tear line moved {(intervalCursorPresents > 1 ? intervalCursorLineMoves / (intervalCursorPresents - 1) : 0):0} scanlines between them on average, {intervalMaxCursorLineMove:0} at most"
                                + $" ({(cursor_tearline_bands > 0 ? $"held to {cursor_tearline_bands} positions a refresh" : "following the cursor")}).");
                 }
@@ -1180,6 +1234,7 @@ namespace osu.Desktop.Raster
             intervalCursorPresents = 0;
             intervalCursorSkips = 0;
             intervalCursorOnlyRefreshes = 0;
+            intervalMergedPresents = 0;
             intervalCursorLineMoves = 0;
             intervalMaxCursorLineMove = 0;
             intervalMaxLateDraw = 0;
