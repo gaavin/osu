@@ -52,14 +52,6 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 {
                     CanBeShown = { BindTarget = slicesCanBeShown },
                 },
-                new SettingsItemV2(new FormSliderBar<double>
-                {
-                    Caption = @"Render headroom",
-                    HintText = @"Time kept spare on top of recent render times. How much of their spread is covered steers itself, so frames start as late, and show a scene as new, as they can. Less is lower latency, until frames start finishing late and the tear line jumps.",
-                    Current = config.GetBindable<double>(OsuSetting.RasterRenderHeadroom),
-                    KeyboardStep = 0.05f,
-                    LabelFormat = v => $@"{v:0.00} ms",
-                }),
                 new SettingsItemV2(new FormCheckBox
                 {
                     Caption = @"Show tear line indicator",

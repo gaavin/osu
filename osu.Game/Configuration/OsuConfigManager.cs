@@ -128,7 +128,6 @@ namespace osu.Game.Configuration
 
             SetDefault(OsuSetting.RasterSyncMode, RasterSyncMode.TearlineSync);
             SetDefault(OsuSetting.RasterFrameSlices, 4, 2, 16);
-            SetDefault(OsuSetting.RasterRenderHeadroom, 0.5, 0, 5, 0.05);
             SetDefault(OsuSetting.RasterShowTearline, false);
 
             SetDefault(OsuSetting.ShowStoryboard, true);
@@ -492,7 +491,6 @@ namespace osu.Game.Configuration
         PMFriendsOnly,
         RasterSyncMode,
         RasterFrameSlices,
-        RasterRenderHeadroom,
         RasterShowTearline,
     }
 }
