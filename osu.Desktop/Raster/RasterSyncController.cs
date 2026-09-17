@@ -149,7 +149,6 @@ namespace osu.Desktop.Raster
 
         private Bindable<RasterSyncMode> modeSetting = null!;
         private Bindable<int> slicesSetting = null!;
-        private Bindable<double> headroomSetting = null!;
         private IBindable<DisplayMode>? displayMode;
 
         private TearlineOffsetFinder? finder;
@@ -158,7 +157,6 @@ namespace osu.Desktop.Raster
         private volatile RasterSyncMode mode;
         private volatile int slices = 1;
         private volatile bool playing;
-        private long headroomNs;
         private volatile DrmVBlankClock? clock;
         private volatile DrmVBlankClock.DisplayHint? displayHint;
 
@@ -425,11 +423,9 @@ namespace osu.Desktop.Raster
             finder = new TearlineOffsetFinder(host.Storage);
 
             slicesSetting = config.GetBindable<int>(OsuSetting.RasterFrameSlices);
-            headroomSetting = config.GetBindable<double>(OsuSetting.RasterRenderHeadroom);
             modeSetting = config.GetBindable<RasterSyncMode>(OsuSetting.RasterSyncMode);
 
             slicesSetting.BindValueChanged(s => slices = s.NewValue, true);
-            headroomSetting.BindValueChanged(h => Interlocked.Exchange(ref headroomNs, (long)(h.NewValue * 1_000_000)), true);
 
             if (host.Window != null)
             {
@@ -556,12 +552,11 @@ namespace osu.Desktop.Raster
             }
 
             long renderNs = renderCosts.Percentile(costPercentile);
-            long headroom = Interlocked.Read(ref headroomNs);
 
             // A collection that is due is paid for by this present: adding it to the cost aims the present at a later
             // slice, which leaves the gap before the frame starts drawing long enough to collect in.
             long reserved = gcPacer.Reserve();
-            long cost = renderNs + headroom + reserved;
+            long cost = renderNs + reserved;
 
             int previousCount = sliceCount;
             int count = 1;
@@ -570,7 +565,7 @@ namespace osu.Desktop.Raster
             {
                 // Frames that overrun a slice leave the next one without a frame of its own, which shows as uneven pacing rather than latency,
                 // so the count is decided on a stricter percentile than the margin a frame starts on.
-                long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + headroom + betweenPresents.Percentile(slice_fit_percentile);
+                long slowFrameNs = renderCosts.Percentile(slice_fit_percentile) + betweenPresents.Percentile(slice_fit_percentile);
 
                 count = chooseSliceCount(timing, slowFrameNs);
 
@@ -578,7 +573,7 @@ namespace osu.Desktop.Raster
                 lastSlowFrameNs = slowFrameNs;
 
                 if (count != previousCount)
-                    logSliceCountChange(timing, previousCount, count, slowFrameNs, headroom);
+                    logSliceCountChange(timing, previousCount, count, slowFrameNs);
 #endif
             }
 
@@ -808,13 +803,13 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Logs where a frame's time went when the slice count changes, since that decides how many slices fit. Draw thread.
         /// </summary>
-        private void logSliceCountChange(DrmVBlankClock.Timing timing, int from, int to, long frameNs, long headroom)
+        private void logSliceCountChange(DrmVBlankClock.Timing timing, int from, int to, long frameNs)
         {
             string rule = to > from ? $" More slices are only used once a frame fits in {slice_raise_fit:0%} of one, for {slice_raise_delay_ns / 1_000_000} ms." : string.Empty;
 
             Logger.Log($"Raster sync: {from} → {to} frame slices per refresh (up to {slices}). A slice at {to} lasts {ms(timing.PeriodNs / to)} ms, "
                        + $"and all but the slowest {1 - slice_fit_percentile:0.0%} of frames need {ms(frameNs)} ms: render {ms(renderCosts.Percentile(slice_fit_percentile))} ms "
-                       + $"(draw {ms(draws.Percentile(slice_fit_percentile))} ms, GPU finish {ms(gpuFinishes.Percentile(slice_fit_percentile))} ms), headroom {ms(headroom)} ms, "
+                       + $"(draw {ms(draws.Percentile(slice_fit_percentile))} ms, GPU finish {ms(gpuFinishes.Percentile(slice_fit_percentile))} ms), "
                        + $"and {ms(betweenPresents.Percentile(slice_fit_percentile))} ms from one swap to planning the next "
                        + $"(swap call {ms(swapCalls.Percentile(slice_fit_percentile))} ms, rest of the frame loop {ms(frameLoops.Percentile(slice_fit_percentile))} ms).{rule}");
         }
@@ -1066,14 +1061,14 @@ namespace osu.Desktop.Raster
                 int overtaken = Interlocked.Exchange(ref intervalOvertaken, 0);
                 double presentsPerSecond = intervalPresents * 1e9 / (end - intervalStart);
                 double lateFraction = (double)intervalLate / intervalPresents;
-                long margin = renderCosts.Percentile(costPercentile) + Interlocked.Read(ref headroomNs);
+                long margin = renderCosts.Percentile(costPercentile);
 
                 string slicesText = mode == RasterSyncMode.FrameSlices ? $"{sliceCount} of up to {slices} slices per refresh, {intervalSkipped} slices skipped, " : string.Empty;
                 string overtakenText = flips + overtaken > 0 ? $", {overtaken} of {flips + overtaken} timed frames overtaken by the next before they flipped" : string.Empty;
 
 #if RASTER_METRICS
                 // What a looser fit rule would have allowed, to size the next change without risking a skipped slice on this one.
-                long looseFrameNs = renderCosts.Percentile(slice_fit_loose) + Interlocked.Read(ref headroomNs) + betweenPresents.Percentile(slice_fit_loose);
+                long looseFrameNs = renderCosts.Percentile(slice_fit_loose) + betweenPresents.Percentile(slice_fit_loose);
                 long looseFits = plannedTiming == null ? 0 : Math.Clamp(plannedTiming.PeriodNs / Math.Max(1, looseFrameNs), 1, Math.Max(1, slices));
 
                 int gen0 = GC.CollectionCount(0) - intervalGen0;
@@ -1087,7 +1082,7 @@ namespace osu.Desktop.Raster
                 // The runtime log keeps what the status note shows, to line up with recordings of the screen afterwards.
                 Logger.Log($"Raster sync: {presentsPerSecond:0} presents/s, {slicesText}{intervalLate} late ({lateFraction:0.0%}, aiming for {late_target:0%}), "
                            + $"{overtaken} of {flips + overtaken} timed frames overtaken, GC {gen0}/{gen1}/{gen2}. "
-                           + $"Frames start {ms(margin)} ms before their scanline (render at the {costPercentile:0.0%} percentile, headroom {ms(Interlocked.Read(ref headroomNs))} ms). "
+                           + $"Frames start {ms(margin)} ms before their scanline (render at the {costPercentile:0.0%} percentile). "
                            + $"All but the slowest {1 - slice_fit_percentile:0.0%} of frames need {ms(lastSlowFrameNs)} ms, which fits {lastFits} slices"
                            + $" (at {1 - slice_fit_loose:0%} it would be {ms(looseFrameNs)} ms and {looseFits} slices), "
                            + $"raising after {slice_raise_delay_ns / 1_000_000} ms with {slice_fit_grace_ns / 1_000_000} ms of grace.");
