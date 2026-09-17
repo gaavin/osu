@@ -55,8 +55,8 @@ namespace osu.Desktop
                 dependencies.CacheAs<IRasterSync>(rasterSyncHost.RasterSync);
 
                 // The input handlers have been initialised by the time the game loads.
-                if (rasterSyncHost.InstallPenLatch() is PenLatch penLatch)
-                    dependencies.CacheAs<IPointerLatch>(penLatch);
+                if (rasterSyncHost.InstallPointerLatch() is PointerLatch pointerLatch)
+                    dependencies.CacheAs<IPointerLatch>(pointerLatch);
             }
 
             return dependencies;

@@ -7,21 +7,21 @@ using osuTK;
 namespace osu.Game.Graphics.Raster
 {
     /// <summary>
-    /// Lets a cursor be drawn where the pen is when the frame is drawn, rather than where it was when the update frame that built the frame read input.
-    /// Provided by hosts that see the tablet's reports as they arrive.
+    /// Lets a cursor be drawn where the pointer is when the frame is drawn, rather than where it was when the update frame that built the frame read input.
+    /// Provided by hosts that see the pen's and the mouse's reports as they arrive.
     /// </summary>
     public interface IPointerLatch
     {
         /// <summary>
-        /// Whether a cursor at this screen space position is following the pen, which is when it sits on one of the pen's recent reports.
-        /// A cursor that follows a replay, a mouse or nothing at all is left where the update frame put it. Update thread.
+        /// Whether a cursor at this screen space position is following a pointer, which is when it sits on one of that device's recent reports.
+        /// A cursor that follows a replay, autoplay or nothing at all is left where the update frame put it. Update thread.
         /// </summary>
         /// <param name="screenSpacePosition">Where the update frame put the cursor.</param>
         /// <param name="extentAbove">How far the cursor can reach above that position on screen, so a tear line can be kept clear of it.</param>
-        bool IsFollowingPen(Vector2 screenSpacePosition, float extentAbove);
+        bool IsFollowingPointer(Vector2 screenSpacePosition, float extentAbove);
 
         /// <summary>
-        /// How far the pen has moved from a position <see cref="IsFollowingPen"/> accepted, in screen space, as of now. Draw thread.
+        /// How far the pointer has moved from a position <see cref="IsFollowingPointer"/> accepted, in screen space, as of now. Draw thread.
         /// </summary>
         Vector2 TakeOffset(Vector2 screenSpacePosition);
 
@@ -32,7 +32,7 @@ namespace osu.Game.Graphics.Raster
 
         /// <summary>
         /// Hands a cursor's draw over to be done once the rest of the frame has finished on the GPU, just before it is presented,
-        /// where it takes the newest pen report as of then. Returns false if draws are not held this frame, or one already is,
+        /// where it takes the newest pointer report as of then. Returns false if draws are not held this frame, or one already is,
         /// in which case the caller draws as usual. Draw thread.
         /// </summary>
         bool TryDeferDraw(ILatchedDraw draw);

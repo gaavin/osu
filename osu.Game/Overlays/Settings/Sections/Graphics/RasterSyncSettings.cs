@@ -35,12 +35,12 @@ namespace osu.Game.Overlays.Settings.Sections.Graphics
                 new SettingsItemV2(new FormEnumDropdown<RasterSyncMode>
                 {
                     Caption = @"Raster sync",
-                    HintText = @"Times each frame against the display's scanout during gameplay. Menus draw as usual. Needs fullscreen, the OpenGL renderer and a frame limiter other than VSync. Cursor chasing adds a second tear line each refresh just above the cursor, drawn at the newest tablet report, for the lowest cursor latency; it needs a tablet through osu!'s own tablet support.",
+                    HintText = @"Times each frame against the display's scanout during gameplay. Menus draw as usual. Needs fullscreen, the OpenGL renderer and a frame limiter other than VSync. Cursor chasing adds a second tear line each refresh just above the cursor, drawn at the newest pen or mouse report, for the lowest cursor latency; a tablet has to go through osu!'s own tablet support.",
                     Current = mode,
                 })
                 {
                     Note = { BindTarget = statusNote },
-                    Keywords = new[] { @"beam racing", @"lagless", @"vsync", @"tearing", @"scanline", @"latency", @"cursor chasing", @"tablet" },
+                    Keywords = new[] { @"beam racing", @"lagless", @"vsync", @"tearing", @"scanline", @"latency", @"cursor chasing", @"tablet", @"mouse" },
                 },
                 new SettingsItemV2(new FormSliderBar<int>
                 {
