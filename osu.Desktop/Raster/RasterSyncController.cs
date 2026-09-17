@@ -260,7 +260,7 @@ namespace osu.Desktop.Raster
 
         /// <summary>
         /// Scanlines between the tear line given to the cursor and the top of the cursor, to cover the tear line landing off target,
-        /// and the pen moving up between planning the present and drawing the cursor. <c>OSU_CURSOR_TEARLINE_LEAD</c> sets it.
+        /// and the pointer moving up between planning the present and drawing the cursor. <c>OSU_CURSOR_TEARLINE_LEAD</c> sets it.
         /// </summary>
         private static readonly int cursor_tearline_lead = int.TryParse(Environment.GetEnvironmentVariable(@"OSU_CURSOR_TEARLINE_LEAD"), out int lead) && lead >= 0 ? lead : 32;
 
@@ -604,10 +604,10 @@ namespace osu.Desktop.Raster
             bool merged = false;
 
             // Chasing the cursor, one more tear line each refresh sits just above it, and its present draws the cursor last, so the cursor is
-            // scanned out right after the newest pen report is taken. With the one tear line a refresh in the blanking interval, that makes two
+            // scanned out right after the newest pointer report is taken. With the one tear line a refresh in the blanking interval, that makes two
             // presents a refresh. It was tried alongside frame slices too, where the cursor's present crowded out 1.6 slices a refresh and play
             // felt unevenly paced, so it has a mode of its own.
-            if (mode == RasterSyncMode.CursorChasing && PenLatch.LATE && host.PenLatch?.TryGetCursorTop(out float cursorTop) == true)
+            if (mode == RasterSyncMode.CursorChasing && PointerLatch.LATE && host.PointerLatch?.TryGetCursorTop(out float cursorTop) == true)
             {
                 long lateNs = lateDraws.Percentile(costPercentile);
                 double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
@@ -899,11 +899,11 @@ namespace osu.Desktop.Raster
             armProbe();
 
             long now = ready;
-            var latch = host.PenLatch;
+            var latch = host.PointerLatch;
 
             if (latch?.HasDeferredDraw == true)
             {
-                // The held cursor is drawn as close to the scanline as its own draw allows, so it takes the newest pen report there is.
+                // The held cursor is drawn as close to the scanline as its own draw allows, so it takes the newest pointer report there is.
                 long lateStart = plannedTarget - lateDraws.Percentile(costPercentile);
 
                 if (ready < lateStart)
@@ -953,7 +953,7 @@ namespace osu.Desktop.Raster
             intervalCollectionsWaiting += presentCollections - readyCollections;
 
             UpdateSync.NotePresent(presentStart);
-            host.PenLatch?.NotePresent(presentStart);
+            host.PointerLatch?.NotePresent(presentStart);
 #endif
             probe?.NoteSwap(presentStart);
 
@@ -1117,9 +1117,9 @@ namespace osu.Desktop.Raster
                 Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart));
                 Logger.Log(pacing.TakeIntervalSummary());
 
-                if (host.PenLatch != null)
+                if (host.PointerLatch != null)
                 {
-                    Logger.Log(host.PenLatch.TakeIntervalSummary()
+                    Logger.Log(host.PointerLatch.TakeIntervalSummary()
                                + $" {intervalLateDraws} were drawn after the rest of the frame finished, taking {ms(lateDraws.Percentile(0.5))}/{ms(lateDraws.Percentile(fixed_percentile))}/{ms(intervalMaxLateDraw)} ms at p50/p99/max"
                                + $" (drawing and submitting {ms(lateDrawSubmits.Percentile(0.5))}/{ms(lateDrawSubmits.Percentile(fixed_percentile))}, {(late_draw_waits_for_gpu ? "then waiting for the GPU" : "not waiting for the GPU")})."
                                + $" {intervalCursorPresents} presents tore {cursor_tearline_lead} lines above the cursor, crowding out {intervalCursorSkips} slices,"

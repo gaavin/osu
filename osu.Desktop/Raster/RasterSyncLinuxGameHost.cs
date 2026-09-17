@@ -39,27 +39,39 @@ namespace osu.Desktop.Raster
             : base(gameName, options)
         {
             RasterSync = new RasterSyncController(this);
+
+            if (Raster.PointerLatch.ENABLED)
+                PointerLatch = new PointerLatch();
         }
 
         // LinuxGameHost's constructor is internal, so what it overrides is repeated here. Its SDL windows are internal too.
         protected override IWindow CreateWindow(GraphicsSurfaceType preferredSurface)
         {
             string windowType = FrameworkEnvironment.UseSDL3 ? @"osu.Framework.Platform.Linux.SDL3LinuxWindow" : @"osu.Framework.Platform.Linux.SDL2LinuxWindow";
-            return (IWindow)Activator.CreateInstance(typeof(LinuxGameHost).Assembly.GetType(windowType, true)!, preferredSurface, Options.FriendlyGameName, Options.BypassCompositor)!;
+            var window = (IWindow)Activator.CreateInstance(typeof(LinuxGameHost).Assembly.GetType(windowType, true)!, preferredSurface, Options.FriendlyGameName, Options.BypassCompositor)!;
+
+            // The mouse reports to the window, which hands its reports to the mouse handler. Following it here, before the input
+            // handlers are initialised, is what puts the latch in front of the handler rather than behind it.
+            PointerLatch?.FollowMouse(window);
+
+            return window;
         }
 
         /// <summary>
-        /// Puts the pen latch in front of the tablet handler, unless it is turned off or the handler is not laid out as expected. Once the input handlers are initialised.
+        /// Puts the pen source in front of the tablet handler, unless the handler is not laid out as expected, and hands over the latch if
+        /// there is any pointer to follow. Once the input handlers are initialised.
         /// </summary>
-        public PenLatch? InstallPenLatch()
+        public PointerLatch? InstallPointerLatch()
         {
-            if (PenLatch == null)
-                PenLatch = PenLatch.TryInstall(AvailableInputHandlers);
+            PointerLatch?.FollowTablet(AvailableInputHandlers);
 
-            return PenLatch;
+            return PointerLatch?.FollowsAnything == true ? PointerLatch : null;
         }
 
-        public PenLatch? PenLatch { get; private set; }
+        /// <summary>
+        /// Follows the pen and the mouse so the cursor can be drawn at their newest report, unless it is turned off with <c>OSU_POINTER_LATCH=0</c>.
+        /// </summary>
+        public PointerLatch? PointerLatch { get; }
 
         protected override ReadableKeyCombinationProvider CreateReadableKeyCombinationProvider() => new LinuxReadableKeyCombinationProvider();
 
@@ -120,7 +132,7 @@ namespace osu.Desktop.Raster
         {
             if (!RasterSync.ShouldPace(findBlocker()))
             {
-                PenLatch?.BeginFrame(false);
+                PointerLatch?.BeginFrame(false);
                 base.DrawFrame();
                 return;
             }
@@ -128,14 +140,14 @@ namespace osu.Desktop.Raster
             if (executionMode.Value == ExecutionMode.SingleThread)
             {
                 // Input, audio and update frames run on this thread right after this draw frame, so the wait for the next present goes last.
-                PenLatch?.BeginFrame(false);
+                PointerLatch?.BeginFrame(false);
                 base.DrawFrame();
                 RasterSync.PlanNextPresent();
             }
             else
             {
                 RasterSync.PlanNextPresent();
-                PenLatch?.BeginFrame(RasterSync.HasPlannedPresent && RasterSync.PlannedForCursor);
+                PointerLatch?.BeginFrame(RasterSync.HasPlannedPresent && RasterSync.PlannedForCursor);
                 base.DrawFrame();
             }
         }
@@ -163,8 +175,8 @@ namespace osu.Desktop.Raster
             if (!RasterSync.HasPlannedPresent)
             {
                 // Nothing is held without a timed present, but a draw handed over regardless must not outlive the frame's state.
-                if (PenLatch?.HasDeferredDraw == true)
-                    PenLatch.DrawDeferred(Renderer);
+                if (PointerLatch?.HasDeferredDraw == true)
+                    PointerLatch.DrawDeferred(Renderer);
 
                 base.Swap();
                 RasterSync.CountPresent();

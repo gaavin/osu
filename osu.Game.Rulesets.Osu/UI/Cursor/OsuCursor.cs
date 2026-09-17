@@ -100,8 +100,8 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
         {
             base.Update();
 
-            // Whether the cursor is on the pen has to be checked every frame, not only the ones it moved in, or one frozen
-            // in place would be carried along by a pen it had already been on.
+            // Whether the cursor is on a pointer has to be checked every frame, not only the ones it moved in, or one frozen
+            // in place would be carried along by a pointer it had already been on.
             if (pointerLatch != null)
                 Invalidate(Invalidation.DrawNode);
         }
@@ -109,7 +109,7 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
         protected override DrawNode CreateDrawNode() => new LatchedCursorDrawNode(this);
 
         /// <summary>
-        /// Draws the cursor at the newest pen report, when the update frame had it following the pen. Where the frame is timed against
+        /// Draws the cursor at the newest pointer report, when the update frame had it following a pointer. Where the frame is timed against
         /// the display, the draw is held until the rest of the frame has finished on the GPU, and drawn on top of it just before it is presented.
         /// </summary>
         /// <remarks>
@@ -146,7 +146,7 @@ namespace osu.Game.Rulesets.Osu.UI.Cursor
                 {
                     // The scaled content can reach past the cursor's own size, and grows further when a key is pressed.
                     var extent = (cursor.cursorScaleContainer ?? (Drawable)cursor).ScreenSpaceDrawQuad.AABBFloat;
-                    following = latch.IsFollowingPen(position, Math.Max(0, position.Y - extent.Top) * 1.3f);
+                    following = latch.IsFollowingPointer(position, Math.Max(0, position.Y - extent.Top) * 1.3f);
                 }
 
                 offsetTaken = false;

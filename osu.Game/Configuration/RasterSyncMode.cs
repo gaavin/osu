@@ -24,7 +24,7 @@ namespace osu.Game.Configuration
 
         /// <summary>
         /// As <see cref="TearlineSync"/>, plus a second present each refresh whose tear line sits just above the cursor, drawing the cursor
-        /// last at the newest pen report, so the cursor is scanned out right after it is drawn.
+        /// last at the newest pen or mouse report, so the cursor is scanned out right after it is drawn.
         /// </summary>
         [Description("Cursor chasing (tear line above the cursor)")]
         CursorChasing,
