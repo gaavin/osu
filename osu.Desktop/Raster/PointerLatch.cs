@@ -172,6 +172,23 @@ namespace osu.Desktop.Raster
             return source != null;
         }
 
+        /// <summary>
+        /// The screen row the top of the cursor will be at, by where the pointer's path puts it at a time: predicted past the newest report,
+        /// sampled <see cref="RESAMPLE_LEAD_NS"/> before that time as the cursor itself is. False if the followed device's reports do not say. Draw thread.
+        /// </summary>
+        public bool TryGetCursorTopAt(long time, out float row)
+        {
+            var source = followed;
+
+            row = 0;
+
+            if (source == null || RESAMPLE_LEAD_NS is not long lead || !source.TryGetPositionAt(time - lead, out Vector2 position, out _))
+                return false;
+
+            row = position.Y - Volatile.Read(ref cursorExtentAbove);
+            return true;
+        }
+
         public Vector2 TakeOffset(Vector2 screenSpacePosition)
         {
             var source = followed;

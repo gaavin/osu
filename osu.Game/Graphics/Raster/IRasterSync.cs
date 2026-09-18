@@ -33,5 +33,11 @@ namespace osu.Game.Graphics.Raster
         /// Discards the flips recorded in previous plays.
         /// </summary>
         void ForgetRecordedFlips();
+
+        /// <summary>
+        /// How far ahead of real time to run the gameplay clock for the update frame running now, in milliseconds of real time,
+        /// so the scene each present shows is the same age when it is scanned out. Zero on average. Update thread.
+        /// </summary>
+        double TakeSceneLeadMilliseconds();
     }
 }

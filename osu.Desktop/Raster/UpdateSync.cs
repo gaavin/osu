@@ -83,6 +83,8 @@ namespace osu.Desktop.Raster
         private const int slot_count = 4;
         private readonly long[] frameStarts = new long[slot_count];
         private readonly long[] frameEnds = new long[slot_count];
+        private readonly long[] frameSceneTimes = new long[slot_count];
+        private readonly long[] frameSceneLeads = new long[slot_count];
         private long publishedFrame;
 #endif
         private int updatesAligned;
@@ -93,6 +95,10 @@ namespace osu.Desktop.Raster
         private readonly DurationWindow updateFrames = new DurationWindow(history);
         private readonly DurationWindow sleepOvershoots = new DurationWindow(history);
         private long frameStart;
+#if RASTER_METRICS
+        private long sceneTime;
+        private long sceneLead;
+#endif
         private int framesSinceEstimate;
         private bool timerSlackSet;
 
@@ -101,6 +107,12 @@ namespace osu.Desktop.Raster
         private readonly DurationWindow drawnUpdateFrames = new DurationWindow(history);
         private readonly DurationWindow agesAtDraw = new DurationWindow(history);
         private readonly DurationWindow agesAtPresent = new DurationWindow(history);
+
+        // How old the gameplay clock the drawn scene was sampled at was at present, before and after it was timed by its present.
+        private readonly DurationWindow sampledAgesAtPresent = new DurationWindow(history);
+        private readonly DurationWindow timedAgesAtPresent = new DurationWindow(history);
+        private long drawnSceneTime;
+        private long drawnSceneLead;
         private readonly DurationWindow idleBeforeDraw = new DurationWindow(history);
         private readonly DurationWindow waitsForUpdate = new DurationWindow(history);
         private long frameAtWake;
@@ -135,6 +147,10 @@ namespace osu.Desktop.Raster
 
                 frameStarts[frame & (slot_count - 1)] = frameStart;
                 frameEnds[frame & (slot_count - 1)] = end;
+                frameSceneTimes[frame & (slot_count - 1)] = sceneTime;
+                frameSceneLeads[frame & (slot_count - 1)] = sceneLead;
+                sceneTime = 0;
+                sceneLead = 0;
                 Volatile.Write(ref publishedFrame, frame);
 #endif
 
@@ -215,6 +231,15 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Draw thread, on waking to draw. The draw takes the newest scene published by then, or waits for the next if it has drawn that one already.
         /// </summary>
+        /// <summary>
+        /// When the running update frame sampled the gameplay clock, and how far <see cref="SceneTiming"/> moved it. Update thread.
+        /// </summary>
+        public void NoteSceneTime(long sampledAt, long lead)
+        {
+            sceneTime = sampledAt;
+            sceneLead = lead;
+        }
+
         public void NoteWake(long wake)
         {
             wakeNs = wake;
@@ -238,6 +263,8 @@ namespace osu.Desktop.Raster
 
             long start = frameStarts[drawn & (slot_count - 1)];
             long end = frameEnds[drawn & (slot_count - 1)];
+            long sampledAt = frameSceneTimes[drawn & (slot_count - 1)];
+            long lead = frameSceneLeads[drawn & (slot_count - 1)];
 
             // Overwritten while it was read.
             if (Volatile.Read(ref publishedFrame) - drawn >= slot_count || end < start)
@@ -265,6 +292,8 @@ namespace osu.Desktop.Raster
             intervalDraws++;
             lastDrawnFrame = drawn;
             drawnFrameStart = start;
+            drawnSceneTime = sampledAt;
+            drawnSceneLead = lead;
             drawnFrameKnown = true;
         }
 
@@ -279,6 +308,12 @@ namespace osu.Desktop.Raster
             long age = presentStart - drawnFrameStart;
 
             agesAtPresent.Add(age);
+
+            if (drawnSceneTime != 0)
+            {
+                sampledAgesAtPresent.Add(Math.Max(0, presentStart - drawnSceneTime));
+                timedAgesAtPresent.Add(Math.Max(0, presentStart - drawnSceneTime - drawnSceneLead));
+            }
             intervalMaxAgeAtPresent = Math.Max(intervalMaxAgeAtPresent, age);
         }
 
@@ -299,7 +334,10 @@ namespace osu.Desktop.Raster
                              + $"Drawn update frames took {ms(drawnUpdateFrames.Percentile(0.5))}/{ms(drawnUpdateFrames.Percentile(0.99))}, "
                              + $"then sat {ms(idleBeforeDraw.Percentile(0.5))}/{ms(idleBeforeDraw.Percentile(0.99))} before the draw woke. "
                              + $"{intervalWaited} of {intervalDraws} draws waited for their update frame, p99 {ms(waitsForUpdate.Percentile(0.99))}. "
-                             + $"Timed update frames aim to finish {ms(Volatile.Read(ref estimateNs))} ms after starting.";
+                             + $"Timed update frames aim to finish {ms(Volatile.Read(ref estimateNs))} ms after starting. "
+                             + $"Gameplay clock age at present, p1/p50/p99: sampled {ms(sampledAgesAtPresent.Percentile(0.01))}/{ms(sampledAgesAtPresent.Percentile(0.5))}/{ms(sampledAgesAtPresent.Percentile(0.99))}, "
+                             + $"as timed {ms(timedAgesAtPresent.Percentile(0.01))}/{ms(timedAgesAtPresent.Percentile(0.5))}/{ms(timedAgesAtPresent.Percentile(0.99))}"
+                             + (SceneTiming.ENABLED ? " (timed by each present's tear line)." : " (scene timing off).");
 
             intervalStartFrame = published;
             intervalDraws = 0;
