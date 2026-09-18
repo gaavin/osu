@@ -993,7 +993,7 @@ namespace osu.Desktop.Raster
             presentCollections = GC.CollectionCount(0);
             intervalCollectionsWaiting += presentCollections - readyCollections;
 
-            UpdateSync.NotePresent(presentStart);
+            UpdateSync.NotePresent(presentStart, plannedTarget);
             host.PointerLatch?.NotePresent(presentStart);
 #endif
             probe?.NoteSwap(presentStart);
