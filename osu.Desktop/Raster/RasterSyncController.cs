@@ -235,6 +235,13 @@ namespace osu.Desktop.Raster
         public readonly UpdateSync UpdateSync = new UpdateSync();
 
         /// <summary>
+        /// Runs the gameplay clock at the time the present that will show each update frame tears.
+        /// </summary>
+        private readonly SceneTiming sceneTiming;
+
+        public double TakeSceneLeadMilliseconds() => sceneTiming.TakeLeadNs() / 1e6;
+
+        /// <summary>
         /// Whether a cursor drawn after the rest of the frame is waited on to finish on the GPU before the present. Off unless
         /// <c>OSU_POINTER_LATCH_WAIT_GPU=1</c>: the cursor is a few quads, and the compositor waits for the GPU before flipping anyway.
         /// </summary>
@@ -272,6 +279,12 @@ namespace osu.Desktop.Raster
         /// shifts it when the cursor crosses into another band, by one band, at the cost of the cursor sitting up to a band below its tear line.
         /// </remarks>
         private static readonly int cursor_tearline_bands = int.TryParse(Environment.GetEnvironmentVariable(@"OSU_CURSOR_TEARLINE_BANDS"), out int bands) && bands >= 0 ? bands : 0;
+
+        /// <summary>
+        /// Whether the cursor's tear line is placed by where the pen is predicted to be as the cursor is scanned out, rather than by its newest report.
+        /// Off with <c>OSU_CURSOR_TEARLINE_PREDICT=0</c>, and whenever the cursor is drawn at the newest report.
+        /// </summary>
+        private static readonly bool cursor_tearline_predicts = Environment.GetEnvironmentVariable(@"OSU_CURSOR_TEARLINE_PREDICT") != @"0" && PointerLatch.RESAMPLE_LEAD_NS != null;
 
         private bool plannedForCursor;
         private bool plannedMerged;
@@ -388,6 +401,9 @@ namespace osu.Desktop.Raster
         private int intervalGen2;
         private int intervalLateDraws;
         private int intervalCursorPresents;
+        private int intervalTopPredictions;
+        private double intervalTopPredictionLines;
+        private double intervalMaxTopPrediction;
         private int intervalCursorSkips;
         private int intervalCursorOnlyRefreshes;
         private int intervalMergedPresents;
@@ -413,6 +429,7 @@ namespace osu.Desktop.Raster
         public RasterSyncController(RasterSyncLinuxGameHost host)
         {
             this.host = host;
+            sceneTiming = new SceneTiming(UpdateSync);
         }
 
         /// <summary>
@@ -609,18 +626,10 @@ namespace osu.Desktop.Raster
             // scanned out right after the newest pointer report is taken. With the one tear line a refresh in the blanking interval, that makes two
             // presents a refresh. It was tried alongside frame slices too, where the cursor's present crowded out 1.6 slices a refresh and play
             // felt unevenly paced, so it has a mode of its own.
-            if (mode == RasterSyncMode.CursorChasing && PointerLatch.LATE && host.PointerLatch?.TryGetCursorTop(out float cursorTop) == true)
+            if (mode == RasterSyncMode.CursorChasing && PointerLatch.LATE && host.PointerLatch is PointerLatch latch && latch.TryGetCursorTop(out float cursorTop))
             {
                 long lateNs = lateDraws.Percentile(costPercentile);
                 double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
-                double line = cursorTop - cursor_tearline_lead;
-
-                if (cursor_tearline_bands > 0)
-                {
-                    double band = (double)timing.VTotal / cursor_tearline_bands;
-
-                    line = blankingLine + Math.Floor((line - blankingLine) / band) * band;
-                }
 
                 // The blanking interval's present is never given up. Measured in play, dropping it whenever the cursor was too close to it for both
                 // left the top of the screen alternating between frames 1.75 ms apart, refresh to refresh. A cursor low on the screen has its tear
@@ -628,41 +637,69 @@ namespace osu.Desktop.Raster
                 // line is only just above anyway, has its draw held on the blanking interval's present instead of a present of its own.
                 double gapLines = (double)(betweenPresents.Percentile(costPercentile) + cost + lateNs) * timing.VTotal / timing.PeriodNs;
 
-                line = Math.Min(line, blankingLine - gapLines);
-                merged = line < blankingLine - timing.VTotal + gapLines;
+                var placed = placeCursorTearline(cursorTop);
 
-                if (merged)
-                    line = blankingLine - timing.VTotal;
-
-                plannedCursorLine = line;
-
-                if (merged)
+                // The pen keeps moving between planning the present and its tear line being scanned out, by up to a couple of milliseconds of travel.
+                // Placed where the pen is predicted to be as the top of the cursor is scanned out, a fast upward movement doesn't carry the cursor into its own tear line.
+                if (cursor_tearline_predicts)
                 {
-                    target = anchor + ceilingDivide(now + cost + lateNs - anchor, slice) * slice;
+                    var scanout = new PointerLatch.Scanout(placed.Target - (long)(offset * timing.PeriodNs / timing.VTotal), timing.VBlankNs, timing.PeriodNs, timing.VDisplay, timing.VTotal);
 
-                    if (target - lastGridTarget < slice / 2 || target <= lastTarget)
-                        target += slice;
+                    if (latch.TryGetCursorTopAt(scanout.RowScannedAt(cursorTop), out float predictedTop))
+                    {
+#if RASTER_METRICS
+                        double moved = Math.Abs(predictedTop - cursorTop);
 
+                        intervalTopPredictions++;
+                        intervalTopPredictionLines += moved;
+                        intervalMaxTopPrediction = Math.Max(intervalMaxTopPrediction, moved);
+#endif
+                        placed = placeCursorTearline(predictedTop);
+                    }
+                }
+
+                merged = placed.Merged;
+                plannedCursorLine = placed.Line;
+
+                // The cursor's tear line has been placed to leave time for a whole frame either side of the blanking interval's, so whichever comes first goes first.
+                if (merged || placed.Target < target)
+                {
+                    target = placed.Target;
                     cost += lateNs;
                     forCursor = true;
                 }
-                else
+
+                (double Line, bool Merged, long Target) placeCursorTearline(float top)
                 {
-                    line += offset;
-                    long cursorBase = timing.VBlankNs + (long)(line * timing.PeriodNs / timing.VTotal);
+                    double line = top - cursor_tearline_lead;
+
+                    if (cursor_tearline_bands > 0)
+                    {
+                        double band = (double)timing.VTotal / cursor_tearline_bands;
+
+                        line = blankingLine + Math.Floor((line - blankingLine) / band) * band;
+                    }
+
+                    line = Math.Min(line, blankingLine - gapLines);
+
+                    if (line < blankingLine - timing.VTotal + gapLines)
+                    {
+                        long blankingTarget = anchor + ceilingDivide(now + cost + lateNs - anchor, slice) * slice;
+
+                        if (blankingTarget - lastGridTarget < slice / 2 || blankingTarget <= lastTarget)
+                            blankingTarget += slice;
+
+                        return (blankingLine - timing.VTotal, true, blankingTarget);
+                    }
+
+                    long cursorBase = timing.VBlankNs + (long)((line + offset) * timing.PeriodNs / timing.VTotal);
                     long cursorTarget = cursorBase + ceilingDivide(now + cost + lateNs - cursorBase, timing.PeriodNs) * timing.PeriodNs;
 
                     // Once a refresh.
                     if (cursorTarget - lastCursorTarget < timing.PeriodNs / 2)
                         cursorTarget += timing.PeriodNs;
 
-                    // The cursor's tear line has been placed to leave time for a whole frame either side of the blanking interval's, so whichever comes first goes first.
-                    if (cursorTarget < target)
-                    {
-                        target = cursorTarget;
-                        cost += lateNs;
-                        forCursor = true;
-                    }
+                    return (line, false, cursorTarget);
                 }
             }
 
@@ -700,6 +737,8 @@ namespace osu.Desktop.Raster
 
             if (UpdateSync.MODE != UpdateSync.SyncMode.Off)
                 UpdateSync.NotePlan(plannedWake, slice);
+
+            sceneTiming.NotePlan(plannedWake, target - (long)(offset * timing.PeriodNs / timing.VTotal));
 
 #if RASTER_METRICS
             // A collection that runs while the draw thread sleeps costs it nothing: the thread is inside a blocking
@@ -1127,7 +1166,10 @@ namespace osu.Desktop.Raster
                                + $" {intervalCursorPresents} presents tore {cursor_tearline_lead} lines above the cursor, crowding out {intervalCursorSkips} slices,"
                                + $" and {intervalCursorOnlyRefreshes} followed another of theirs with no slice between, while {intervalMergedPresents} shared a slice's present."
                                + $" Their tear line moved {(intervalCursorPresents > 1 ? intervalCursorLineMoves / (intervalCursorPresents - 1) : 0):0} scanlines between them on average, {intervalMaxCursorLineMove:0} at most"
-                               + $" ({(cursor_tearline_bands > 0 ? $"held to {cursor_tearline_bands} positions a refresh" : "following the cursor")}).");
+                               + $" ({(cursor_tearline_bands > 0 ? $"held to {cursor_tearline_bands} positions a refresh" : "following the cursor")})."
+                               + (cursor_tearline_predicts
+                                   ? $" {intervalTopPredictions} were placed by the pen's predicted position, {(intervalTopPredictions > 0 ? intervalTopPredictionLines / intervalTopPredictions : 0):0.0} scanlines from its newest report on average, {intervalMaxTopPrediction:0} at most."
+                                   : " Their tear line is placed by the pen's newest report."));
                 }
 #else
                 status = $"{clock?.Status}. {presentsPerSecond:0} presents/s, {slicesText}"
@@ -1229,6 +1271,9 @@ namespace osu.Desktop.Raster
             intervalGen2 = GC.CollectionCount(2);
             intervalLateDraws = 0;
             intervalCursorPresents = 0;
+            intervalTopPredictions = 0;
+            intervalTopPredictionLines = 0;
+            intervalMaxTopPrediction = 0;
             intervalCursorSkips = 0;
             intervalCursorOnlyRefreshes = 0;
             intervalMergedPresents = 0;
