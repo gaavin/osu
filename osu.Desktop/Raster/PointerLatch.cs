@@ -39,6 +39,45 @@ namespace osu.Desktop.Raster
         /// </summary>
         public static readonly bool LATE = Environment.GetEnvironmentVariable(@"OSU_POINTER_LATCH") != @"draw";
 
+        /// <summary>
+        /// How long before its row is scanned out a timed device's path is sampled for the cursor, or null to draw it at the newest report.
+        /// <c>OSU_POINTER_RESAMPLE</c> sets it in milliseconds, or <c>off</c>. At 0 the path is predicted up to scanout, from the velocity over the last couple of reports;
+        /// at a report interval or more (about 1 on the CTL-480) it is only ever interpolated between reports, and the cursor is that much older.
+        /// </summary>
+        /// <remarks>
+        /// The pen reports about once a millisecond on its own clock while the display scans out on another, so drawn at the newest report the cursor is
+        /// between nothing and a report interval old at scanout, differently every refresh, and wobbles along its path. Moving the present cannot fix that:
+        /// with a fixed refresh the cursor's row is scanned out at the same point of every refresh whenever the frame was presented. Sampling the path
+        /// at a fixed time before that point makes every refresh's cursor the same age.
+        /// </remarks>
+        public static readonly long? RESAMPLE_LEAD_NS = parseResampleLead(Environment.GetEnvironmentVariable(@"OSU_POINTER_RESAMPLE"));
+
+        private static long? parseResampleLead(string? value)
+        {
+            if (value == @"off")
+                return null;
+
+            return double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double ms) && ms >= 0
+                ? (long)(ms * 1_000_000)
+                : 0;
+        }
+
+        /// <summary>
+        /// When a frame's tear line is scanned out, and how the display scans, so the time a row of it is scanned out can be worked out.
+        /// </summary>
+        public readonly record struct Scanout(long TearNs, long VBlankNs, long PeriodNs, int VDisplay, int VTotal)
+        {
+            /// <summary>
+            /// When a row is first scanned out from this frame's tear line on.
+            /// </summary>
+            public long RowScannedAt(float row)
+            {
+                long rowAt = VBlankNs + (long)(Math.Clamp(row, 0, VDisplay - 1) * PeriodNs / VTotal);
+
+                return rowAt + (long)Math.Ceiling((double)(TearNs - rowAt) / PeriodNs) * PeriodNs;
+            }
+        }
+
         // Devices are found on their own threads, well after the update and draw threads are reading this, so it is replaced whole rather than added to.
         private volatile PointerSource[] sources = Array.Empty<PointerSource>();
 
@@ -53,6 +92,7 @@ namespace osu.Desktop.Raster
         // Draw thread only.
         private bool defersDraws;
         private ILatchedDraw? deferred;
+        private Scanout? scanout;
 
         /// <summary>
         /// Whether any device is followed, or may yet be: without one the cursor is drawn where update frames put it.
@@ -139,7 +179,32 @@ namespace osu.Desktop.Raster
             if (source == null)
                 return Vector2.Zero;
 
-            Vector2 offset = source.Latest - screenSpacePosition;
+            Vector2 latest = source.Latest;
+            Vector2 drawn = latest;
+
+            if (RESAMPLE_LEAD_NS is long lead && scanout is Scanout frame)
+            {
+                long sampleAt = frame.RowScannedAt(latest.Y) - lead;
+
+                if (source.TryGetPositionAt(sampleAt, out drawn, out long newestAt))
+                {
+#if RASTER_METRICS
+                    long ahead = sampleAt - newestAt;
+
+                    if (ahead >= 0)
+                    {
+                        intervalPredicted++;
+                        predictionHorizons.Add(ahead);
+                    }
+                    else
+                        intervalInterpolated++;
+
+                    resampleShifts.Add((long)((drawn - latest).Length * offset_scale));
+#endif
+                }
+            }
+
+            Vector2 offset = drawn - screenSpacePosition;
 
 #if RASTER_METRICS
             takenAt = Native.MonotonicNs();
@@ -170,10 +235,13 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Draw thread, before a frame is drawn: whether its present is the one timed to tear just above the cursor, which is the only one a held draw is worth it for.
         /// </summary>
-        public void BeginFrame(bool timedForCursor)
+        /// <param name="timedForCursor">Whether the present is the one timed to tear just above the cursor.</param>
+        /// <param name="frameScanout">When the frame's tear line is planned to be scanned out, if its present is timed, which the cursor is sampled against.</param>
+        public void BeginFrame(bool timedForCursor, Scanout? frameScanout = null)
         {
             defersDraws = timedForCursor && LATE;
             deferred = null;
+            scanout = frameScanout;
         }
 
         public bool HasDeferredDraw => deferred != null;
@@ -216,6 +284,11 @@ namespace osu.Desktop.Raster
         /// </summary>
         private readonly DurationWindow lateLatchToPresent = new DurationWindow(metric_history);
 
+        private readonly DurationWindow predictionHorizons = new DurationWindow(metric_history);
+        private readonly DurationWindow resampleShifts = new DurationWindow(metric_history);
+        private int intervalPredicted;
+        private int intervalInterpolated;
+
         private long takenAt;
         private bool takenLate;
         private bool drawingDeferred;
@@ -252,7 +325,14 @@ namespace osu.Desktop.Raster
                              + $"by {offsets.Percentile(0.5) / offset_scale:0.0}/{offsets.Percentile(0.99) / offset_scale:0.0}/{intervalMaxOffset:0.0} px at p50/p99/max. "
                              + $"Milliseconds at p50/p99: the newest report was {PointerSource.Ms(reportAges.Percentile(0.5))}/{PointerSource.Ms(reportAges.Percentile(0.99))} old when drawn, "
                              + $"and presented {PointerSource.Ms(latchToPresent.Percentile(0.5))}/{PointerSource.Ms(latchToPresent.Percentile(0.99))} later, "
-                             + $"{PointerSource.Ms(lateLatchToPresent.Percentile(0.5))}/{PointerSource.Ms(lateLatchToPresent.Percentile(0.99))} for cursors drawn after the rest of the frame.";
+                             + $"{PointerSource.Ms(lateLatchToPresent.Percentile(0.5))}/{PointerSource.Ms(lateLatchToPresent.Percentile(0.99))} for cursors drawn after the rest of the frame. "
+                             + (RESAMPLE_LEAD_NS is long lead
+                                 ? $"Sampled {PointerSource.Ms(lead)} ms before scanout: {intervalPredicted} predicted past the newest report by {PointerSource.Ms(predictionHorizons.Percentile(0.5))}/{PointerSource.Ms(predictionHorizons.Percentile(0.99))} ms, "
+                                   + $"{intervalInterpolated} between reports, moving the cursor {resampleShifts.Percentile(0.5) / offset_scale:0.0}/{resampleShifts.Percentile(0.99) / offset_scale:0.0} px from the newest report at p50/p99."
+                                 : "Drawn at the newest report.");
+
+            intervalPredicted = 0;
+            intervalInterpolated = 0;
 
             intervalTaken = 0;
             intervalMaxOffset = 0;

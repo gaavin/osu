@@ -147,7 +147,7 @@ namespace osu.Desktop.Raster
             else
             {
                 RasterSync.PlanNextPresent();
-                PointerLatch?.BeginFrame(RasterSync.HasPlannedPresent && RasterSync.PlannedForCursor);
+                PointerLatch?.BeginFrame(RasterSync.HasPlannedPresent && RasterSync.PlannedForCursor, RasterSync.PlannedScanout);
                 base.DrawFrame();
             }
         }

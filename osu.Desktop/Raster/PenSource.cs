@@ -31,7 +31,7 @@ namespace osu.Desktop.Raster
         private readonly IBindable<TabletInfo?> tablet;
 
         private PenSource(PointerLatch latch, OpenTabletDriverHandler handler)
-            : base(@"pen")
+            : base(@"pen", timed: true)
         {
             this.latch = latch;
             this.handler = handler;

@@ -518,6 +518,13 @@ namespace osu.Desktop.Raster
         public bool PlannedForCursor => plannedForCursor;
 
         /// <summary>
+        /// When the planned present's tear line is scanned out, which is the present's target less the offset it is steered by. Draw thread.
+        /// </summary>
+        public PointerLatch.Scanout? PlannedScanout => planned && plannedTiming is DrmVBlankClock.Timing timing
+            ? new PointerLatch.Scanout(plannedTarget - (long)(plannedOffset * timing.PeriodNs / timing.VTotal), timing.VBlankNs, timing.PeriodNs, timing.VDisplay, timing.VTotal)
+            : null;
+
+        /// <summary>
         /// Picks the scanline the next present should tear at, then sleeps until the frame has to start. Draw thread.
         /// </summary>
         public void PlanNextPresent()

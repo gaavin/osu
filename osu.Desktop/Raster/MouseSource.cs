@@ -26,7 +26,7 @@ namespace osu.Desktop.Raster
     internal sealed class MouseSource : PointerSource
     {
         private MouseSource()
-            : base(@"mouse")
+            : base(@"mouse", timed: false)
         {
         }
 
