@@ -817,6 +817,9 @@ namespace osu.Desktop.Raster
             Native.SleepUntil(plannedWake);
             wakeTime = Native.MonotonicNs();
 
+            if (SceneTiming.ENABLED)
+                sceneTiming.NoteDraw(wakeTime, target - offsetNs);
+
 #if RASTER_METRICS
             UpdateSync.NoteWake(wakeTime);
             wakeCollections = GC.CollectionCount(0);
@@ -1221,7 +1224,7 @@ namespace osu.Desktop.Raster
 
                 Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart)
                            + (SceneTiming.ENABLED
-                               ? $" Each present tore {ms(foresightErrors.Percentile(0.5))}/{ms(foresightErrors.Percentile(0.99))} ms at p50/p99 from where it was foreseen, {intervalForesightMisses} of them half a refresh or more."
+                               ? $" Each present tore {ms(foresightErrors.Percentile(0.5))}/{ms(foresightErrors.Percentile(0.99))} ms at p50/p99 from where it was foreseen, {intervalForesightMisses} of them half a refresh or more." + sceneTiming.Summary()
                                : string.Empty));
 
                 intervalForesightMisses = 0;

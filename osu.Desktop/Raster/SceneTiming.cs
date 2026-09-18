@@ -7,22 +7,22 @@ using System.Threading;
 namespace osu.Desktop.Raster
 {
     /// <summary>
-    /// Times the gameplay clock by when each update frame's scene will be scanned out, rather than by when the update frame happened to run.
+    /// Times the gameplay clock so each present's scene steps by exactly the time between tear lines, rather than by when update frames happened to run.
     /// </summary>
     /// <remarks>
     /// The update thread runs free, a dozen update frames to a present, and a draw picks up whichever finished last before it woke. So the scene a
-    /// present shows was sampled anywhere from nothing to an update frame before the draw, and the draw starts a render margin before a tear line that
-    /// itself moves between presents. Measured in play, a scene was 1.71 ms old at present at p50 and 2.55 ms at p99, differently every present, which
-    /// moves hit objects unevenly by the same mismatch of clocks that wobbled the cursor.
+    /// present shows was sampled anywhere up to an update frame before the draw, and the draw starts a render margin before a tear line that itself
+    /// moves between presents: hit objects step unevenly from one present to the next.
     ///
-    /// Each update frame's gameplay clock is instead run at the time the present that will show it tears, less a running mean of that lead, so every
-    /// present shows a scene the same age at its tear line. The mean keeps the clock where it was on average, so judgements and the audio offset are
-    /// unchanged but for the variation.
+    /// The clock runs at real time, shifted by the render margin of the present that will show the update frame, and holds still for a short window
+    /// before that present's draw wakes. The frame the draw picks up is almost always sampled inside that window, so its clock reads exactly the
+    /// present's tear time less a constant, whatever point of the update frame the draw caught. The window is the 90th percentile of how long before the
+    /// wake drawn frames were sampled. Update frames that run once a draw has woken belong to the next present, which the draw thread foresees as it plans.
     ///
-    /// Which present shows an update frame depends on when the frame publishes its scene against when the draws wake. A frame that publishes once the
-    /// planned present's draw has woken is shown by the present after, which isn't planned until the planned one has been swapped, so the draw thread
-    /// foresees it as it plans each present. Timing those frames by the planned present instead, as a first version did, left the clock's age as uneven
-    /// as sampling it: the gap before a draw wakes is often shorter than an update frame, so the drawn frame had often started before its present was planned.
+    /// The constant is steered so drawn scenes are on average exactly as old as without the timing. A first version averaged the shift over every update
+    /// frame instead, which kept judgements exactly where they were, but most update frames are never drawn and were timed well ahead of the ones that are,
+    /// so every drawn scene came out 1.9 ms older, and play felt it: the cursor seemed slow against the playfield. Centred on drawn frames, judgements move
+    /// by however far the clock runs ahead on average, which the log reports. <c>OSU_RASTER_SCENE_CENTRE=all</c> goes back to centring on every update frame.
     /// </remarks>
     internal sealed class SceneTiming
     {
@@ -30,6 +30,12 @@ namespace osu.Desktop.Raster
         /// Off with <c>OSU_RASTER_SCENE_TIMING=0</c>, which runs the gameplay clock at the time each update frame runs.
         /// </summary>
         public static readonly bool ENABLED = Environment.GetEnvironmentVariable(@"OSU_RASTER_SCENE_TIMING") != @"0";
+
+        /// <summary>
+        /// Whether the clock's shift is centred on the update frames that are drawn, keeping drawn scenes as old as they would be untimed, rather than on
+        /// every update frame, keeping judgements where they would be.
+        /// </summary>
+        public static readonly bool CENTRE_ON_DRAWN = Environment.GetEnvironmentVariable(@"OSU_RASTER_SCENE_CENTRE") != @"all";
 
         /// <summary>
         /// A plan older than this is from before pacing stopped.
@@ -42,14 +48,19 @@ namespace osu.Desktop.Raster
         private const long max_lead_ns = 4_000_000;
 
         /// <summary>
-        /// How many update frames the mean lead is averaged over, about a second and a half at the rates measured in play.
+        /// The share of drawn frames the hold before each wake is sized to cover.
         /// </summary>
-        private const double mean_frames = 4096;
+        private const double hold_percentile = 0.9;
 
         /// <summary>
-        /// How many update frames the time from sampling the clock to publishing the scene is averaged over.
+        /// Draws between resizing the hold.
         /// </summary>
-        private const double publish_frames = 256;
+        private const int hold_interval = 64;
+
+        /// <summary>
+        /// How many samples the running means are taken over.
+        /// </summary>
+        private const double mean_frames = 1024;
 
         // Written on the draw thread, read on the update thread, as a sequence: odd while being written.
         private int planSequence;
@@ -58,11 +69,29 @@ namespace osu.Desktop.Raster
         private long nextWake;
         private long nextTear;
 
+        // Written on the draw thread, read on the update thread.
+        private long holdNs = 300_000;
+        private long centreNs = long.MinValue;
+
+        // Written on the update thread, read on the draw thread: the sample time and shift of the newest published update frame.
+        private const int slot_count = 4;
+        private readonly long[] slotSampledAt = new long[slot_count];
+        private readonly long[] slotLead = new long[slot_count];
+        private readonly long[] slotRaw = new long[slot_count];
+        private long published;
+
         // Update thread only.
-        private double meanLeadNs = double.NaN;
+        private double meanRawNs = double.NaN;
         private double publishDelayNs;
         private long sampledAt;
+        private long frameLead;
+        private long frameRaw;
         private long lastSceneNs;
+
+        // Draw thread only.
+        private readonly DurationWindow drawnPhases = new DurationWindow(1024);
+        private int drawsSinceHold;
+        private double meanDrawnRawNs = double.NaN;
 
         private readonly UpdateSync updateSync;
 
@@ -105,34 +134,37 @@ namespace osu.Desktop.Raster
                 followingTear = Volatile.Read(ref nextTear);
             } while ((sequence & 1) != 0 || sequence != Volatile.Read(ref planSequence));
 
-            sampledAt = now;
-
             long lead = 0;
+            long raw = 0;
 
             if (wake != 0 && now - wake < stale_plan_ns)
             {
                 // A draw shows the newest scene published before it wakes.
-                long published = now + (long)publishDelayNs;
-                long scene;
+                bool planned = now + (long)publishDelayNs < wake;
+                long showWake = planned ? wake : followingWake;
+                long showTear = planned ? tear : followingTear;
 
-                if (published < wake)
-                    scene = tear;
-                else if (published < followingWake)
-                    scene = followingTear;
-                else
-                    scene = followingTear + (published - followingWake);
+                // Real time plus that present's margin, held still for the window before its draw wakes.
+                raw = Math.Min(now, showWake - Volatile.Read(ref holdNs)) + (showTear - showWake) - now;
 
-                long raw = scene - now;
+                meanRawNs = double.IsNaN(meanRawNs) ? raw : meanRawNs + (raw - meanRawNs) / mean_frames;
 
-                meanLeadNs = double.IsNaN(meanLeadNs) ? raw : meanLeadNs + (raw - meanLeadNs) / mean_frames;
-                lead = Math.Clamp(raw - (long)meanLeadNs, -max_lead_ns, max_lead_ns);
+                long centre = CENTRE_ON_DRAWN ? Volatile.Read(ref centreNs) : (long)meanRawNs;
+
+                if (centre == long.MinValue)
+                    centre = (long)meanRawNs;
+
+                lead = Math.Clamp(raw - centre, -max_lead_ns, max_lead_ns);
             }
 
-            // Never step the scene back: a frame timed by the foreseen present may have been timed a little past the one actually planned.
+            // Never step the scene back.
             if (lastSceneNs != 0 && now + lead < lastSceneNs)
                 lead = lastSceneNs - now;
 
             lastSceneNs = now + lead;
+            sampledAt = now;
+            frameLead = lead;
+            frameRaw = raw;
 
 #if RASTER_METRICS
             updateSync.NoteSceneTime(now, lead);
@@ -149,12 +181,95 @@ namespace osu.Desktop.Raster
             if (!ENABLED || sampledAt == 0)
                 return;
 
-            long delay = Native.MonotonicNs() - sampledAt;
-
-            sampledAt = 0;
+            long end = Native.MonotonicNs();
+            long delay = end - sampledAt;
 
             if (delay < stale_plan_ns)
-                publishDelayNs += (delay - publishDelayNs) / publish_frames;
+                publishDelayNs += (delay - publishDelayNs) / mean_frames;
+
+            long frame = published + 1;
+
+            slotSampledAt[frame & (slot_count - 1)] = sampledAt;
+            slotLead[frame & (slot_count - 1)] = frameLead;
+            slotRaw[frame & (slot_count - 1)] = frameRaw;
+            Volatile.Write(ref published, frame);
+
+            sampledAt = 0;
         }
+
+        /// <summary>
+        /// A draw has woken for the present planned last, and picks up the newest published scene. Draw thread.
+        /// </summary>
+        public void NoteDraw(long wake, long tear)
+        {
+            long frame = Volatile.Read(ref published);
+
+            if (frame == 0)
+                return;
+
+            long sampled = slotSampledAt[frame & (slot_count - 1)];
+            long lead = slotLead[frame & (slot_count - 1)];
+            long raw = slotRaw[frame & (slot_count - 1)];
+
+            // Overwritten while it was read.
+            if (Volatile.Read(ref published) - frame >= slot_count - 1 || sampled == 0)
+                return;
+
+            drawnPhases.Add(Math.Max(0, wake - sampled));
+
+            if (++drawsSinceHold >= hold_interval)
+            {
+                drawsSinceHold = 0;
+                Volatile.Write(ref holdNs, drawnPhases.Percentile(hold_percentile));
+            }
+
+            // Centring on the drawn frames' mean shift keeps drawn scenes, on average, exactly as old as untimed.
+            meanDrawnRawNs = double.IsNaN(meanDrawnRawNs) ? raw : meanDrawnRawNs + (raw - meanDrawnRawNs) / mean_frames;
+
+            if (CENTRE_ON_DRAWN)
+                Volatile.Write(ref centreNs, (long)meanDrawnRawNs);
+
+#if RASTER_METRICS
+            noteStep(wake, tear, sampled, sampled + lead);
+#endif
+        }
+
+#if RASTER_METRICS
+        // Draw thread: each drawn scene's time step against the step between tear lines, as sampled and as timed.
+        private readonly DurationWindow sampledSteps = new DurationWindow(1024);
+        private readonly DurationWindow timedSteps = new DurationWindow(1024);
+        private long lastTear;
+        private long lastSampled;
+        private long lastTimed;
+        private long lastWake;
+
+        private void noteStep(long wake, long tear, long sampled, long timed)
+        {
+            // Only consecutive presents, not the first after pacing starts or after a stall.
+            if (lastTear != 0 && tear > lastTear && wake - lastWake < stale_plan_ns / 5)
+            {
+                long tearStep = tear - lastTear;
+
+                sampledSteps.Add(Math.Abs(sampled - lastSampled - tearStep));
+                timedSteps.Add(Math.Abs(timed - lastTimed - tearStep));
+            }
+
+            lastTear = tear;
+            lastSampled = sampled;
+            lastTimed = timed;
+            lastWake = wake;
+        }
+
+        /// <summary>
+        /// The scene timing's part of a log line. Draw thread.
+        /// </summary>
+        public string Summary() =>
+            $" Scene steps against tear line steps, ms off at p50/p90/p99: sampled {ms(sampledSteps.Percentile(0.5))}/{ms(sampledSteps.Percentile(0.9))}/{ms(sampledSteps.Percentile(0.99))}, "
+            + $"timed {ms(timedSteps.Percentile(0.5))}/{ms(timedSteps.Percentile(0.9))}/{ms(timedSteps.Percentile(0.99))}. "
+            + $"Held {ms(Volatile.Read(ref holdNs))} ms before each wake, centred on {(CENTRE_ON_DRAWN ? "drawn frames" : "every update frame")}, "
+            + $"running the clock {(meanRawNs - (CENTRE_ON_DRAWN ? Volatile.Read(ref centreNs) : meanRawNs)) / 1e6:+0.000;-0.000} ms ahead on average, which is how far judgements move.";
+
+        private static string ms(long ns) => $"{ns / 1e6:0.000}";
+#endif
     }
 }
