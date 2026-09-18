@@ -242,6 +242,11 @@ namespace osu.Desktop.Raster
         public double TakeSceneLeadMilliseconds() => sceneTiming.TakeLeadNs() / 1e6;
 
         /// <summary>
+        /// The update frame has published its scene. Update thread.
+        /// </summary>
+        public void NoteUpdateFrameEnd() => sceneTiming.NoteUpdateFrameEnd();
+
+        /// <summary>
         /// Whether a cursor drawn after the rest of the frame is waited on to finish on the GPU before the present. Off unless
         /// <c>OSU_POINTER_LATCH_WAIT_GPU=1</c>: the cursor is a few quads, and the compositor waits for the GPU before flipping anyway.
         /// </summary>
@@ -402,6 +407,11 @@ namespace osu.Desktop.Raster
         private int intervalLateDraws;
         private int intervalCursorPresents;
         private int intervalTopPredictions;
+
+        // How far each present's tear time landed from where it was foreseen as the one before was planned, and how many were foreseen a refresh or more out.
+        private readonly DurationWindow foresightErrors = new DurationWindow(cost_history);
+        private long foreseenTear;
+        private int intervalForesightMisses;
         private double intervalTopPredictionLines;
         private double intervalMaxTopPrediction;
         private int intervalCursorSkips;
@@ -542,6 +552,119 @@ namespace osu.Desktop.Raster
             : null;
 
         /// <summary>
+        /// Where a present planned at a time should tear, given the presents before it: the next slice, or in cursor chasing the cursor's tear line if that comes first.
+        /// Has no effect on the controller, so it can also foresee the present after the one being planned, and <c>measure</c> says whether it is the one being planned, whose placement is counted in the log. Draw thread.
+        /// </summary>
+        private (long Target, long Cost, bool ForCursor, bool Merged, double CursorLine, long Anchor) choosePresent(DrmVBlankClock.Timing timing, long now, long cost, int count, double offset,
+                                                                                                                long lastTarget, long lastGridTarget, long lastCursorTarget, bool measure)
+        {
+            long slice = timing.PeriodNs / count;
+
+            // The first tear line of each refresh aims at the middle of the blanking interval, moved by the offset.
+            // Further slices follow at even spacing down the screen.
+            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + offset;
+            long anchor = timing.VBlankNs + (long)(tearline * timing.PeriodNs / timing.VTotal);
+
+            long target = anchor + ceilingDivide(now + cost - anchor, slice) * slice;
+
+            // A frame that finished early would otherwise tear into the slice the previous frame went to. Measured from the last slice's
+            // present rather than the cursor's, which tears between slices: with one tear line a refresh, half a refresh from the cursor's
+            // present pushed the blanking interval's present back a whole refresh whenever the cursor was in the lower half of the screen.
+            if (target - lastGridTarget < slice / 2 || target <= lastTarget)
+                target += slice;
+
+            bool forCursor = false;
+            bool merged = false;
+            double cursorLine = 0;
+
+            // Chasing the cursor, one more tear line each refresh sits just above it, and its present draws the cursor last, so the cursor is
+            // scanned out right after the newest pointer report is taken. With the one tear line a refresh in the blanking interval, that makes two
+            // presents a refresh. It was tried alongside frame slices too, where the cursor's present crowded out 1.6 slices a refresh and play
+            // felt unevenly paced, so it has a mode of its own.
+            if (mode == RasterSyncMode.CursorChasing && PointerLatch.LATE && host.PointerLatch is PointerLatch latch && latch.TryGetCursorTop(out float cursorTop))
+            {
+                long lateNs = lateDraws.Percentile(costPercentile);
+                double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
+
+                // The blanking interval's present is never given up. Measured in play, dropping it whenever the cursor was too close to it for both
+                // left the top of the screen alternating between frames 1.75 ms apart, refresh to refresh. A cursor low on the screen has its tear
+                // line pulled up far enough for a whole frame to fit before the blanking interval's, and one high on the screen, which that tear
+                // line is only just above anyway, has its draw held on the blanking interval's present instead of a present of its own.
+                double gapLines = (double)(betweenPresents.Percentile(costPercentile) + cost + lateNs) * timing.VTotal / timing.PeriodNs;
+
+                var placed = placeCursorTearline(cursorTop);
+
+                // The pen keeps moving between planning the present and its tear line being scanned out, by up to a couple of milliseconds of travel.
+                // Placed where the pen is predicted to be as the top of the cursor is scanned out, a fast upward movement doesn't carry the cursor into its own tear line.
+                if (cursor_tearline_predicts)
+                {
+                    var scanout = new PointerLatch.Scanout(placed.Target - (long)(offset * timing.PeriodNs / timing.VTotal), timing.VBlankNs, timing.PeriodNs, timing.VDisplay, timing.VTotal);
+
+                    if (latch.TryGetCursorTopAt(scanout.RowScannedAt(cursorTop), out float predictedTop))
+                    {
+#if RASTER_METRICS
+                        if (measure)
+                        {
+                            double moved = Math.Abs(predictedTop - cursorTop);
+
+                            intervalTopPredictions++;
+                            intervalTopPredictionLines += moved;
+                            intervalMaxTopPrediction = Math.Max(intervalMaxTopPrediction, moved);
+                        }
+#endif
+                        placed = placeCursorTearline(predictedTop);
+                    }
+                }
+
+                merged = placed.Merged;
+                cursorLine = placed.Line;
+
+                // The cursor's tear line has been placed to leave time for a whole frame either side of the blanking interval's, so whichever comes first goes first.
+                if (merged || placed.Target < target)
+                {
+                    target = placed.Target;
+                    cost += lateNs;
+                    forCursor = true;
+                }
+
+                (double Line, bool Merged, long Target) placeCursorTearline(float top)
+                {
+                    double line = top - cursor_tearline_lead;
+
+                    if (cursor_tearline_bands > 0)
+                    {
+                        double band = (double)timing.VTotal / cursor_tearline_bands;
+
+                        line = blankingLine + Math.Floor((line - blankingLine) / band) * band;
+                    }
+
+                    line = Math.Min(line, blankingLine - gapLines);
+
+                    if (line < blankingLine - timing.VTotal + gapLines)
+                    {
+                        long blankingTarget = anchor + ceilingDivide(now + cost + lateNs - anchor, slice) * slice;
+
+                        if (blankingTarget - lastGridTarget < slice / 2 || blankingTarget <= lastTarget)
+                            blankingTarget += slice;
+
+                        return (blankingLine - timing.VTotal, true, blankingTarget);
+                    }
+
+                    long cursorBase = timing.VBlankNs + (long)((line + offset) * timing.PeriodNs / timing.VTotal);
+                    long cursorTarget = cursorBase + ceilingDivide(now + cost + lateNs - cursorBase, timing.PeriodNs) * timing.PeriodNs;
+
+                    // Once a refresh.
+                    if (cursorTarget - lastCursorTarget < timing.PeriodNs / 2)
+                        cursorTarget += timing.PeriodNs;
+
+                    return (line, false, cursorTarget);
+                }
+            }
+
+            return (target, cost, forCursor, merged, cursorLine, anchor);
+        }
+
+        /// <summary>
         /// Picks the scanline the next present should tear at, then sleeps until the frame has to start. Draw thread.
         /// </summary>
         public void PlanNextPresent()
@@ -603,105 +726,23 @@ namespace osu.Desktop.Raster
 
             long slice = timing.PeriodNs / count;
 
-            // The first tear line of each refresh aims at the middle of the blanking interval, moved by the offset.
-            // Further slices follow at even spacing down the screen.
             double offset = steerOffset(timing);
             plannedOffset = offset;
-            double tearline = (timing.VDisplay + timing.VTotal) / 2.0 + offset;
-            long anchor = timing.VBlankNs + (long)(tearline * timing.PeriodNs / timing.VTotal);
+            long offsetNs = (long)(offset * timing.PeriodNs / timing.VTotal);
 
             long now = Native.MonotonicNs();
-            long target = anchor + ceilingDivide(now + cost - anchor, slice) * slice;
+            var plan = choosePresent(timing, now, cost, count, offset, lastTarget, lastGridTarget, lastCursorTarget, true);
 
-            // A frame that finished early would otherwise tear into the slice the previous frame went to. Measured from the last slice's
-            // present rather than the cursor's, which tears between slices: with one tear line a refresh, half a refresh from the cursor's
-            // present pushed the blanking interval's present back a whole refresh whenever the cursor was in the lower half of the screen.
-            if (target - lastGridTarget < slice / 2 || target <= lastTarget)
-                target += slice;
+            long target = plan.Target;
+            bool forCursor = plan.ForCursor;
+            bool merged = plan.Merged;
 
-            bool forCursor = false;
-            bool merged = false;
+            cost = plan.Cost;
 
-            // Chasing the cursor, one more tear line each refresh sits just above it, and its present draws the cursor last, so the cursor is
-            // scanned out right after the newest pointer report is taken. With the one tear line a refresh in the blanking interval, that makes two
-            // presents a refresh. It was tried alongside frame slices too, where the cursor's present crowded out 1.6 slices a refresh and play
-            // felt unevenly paced, so it has a mode of its own.
-            if (mode == RasterSyncMode.CursorChasing && PointerLatch.LATE && host.PointerLatch is PointerLatch latch && latch.TryGetCursorTop(out float cursorTop))
-            {
-                long lateNs = lateDraws.Percentile(costPercentile);
-                double blankingLine = (timing.VDisplay + timing.VTotal) / 2.0;
+            if (forCursor)
+                plannedCursorLine = plan.CursorLine;
 
-                // The blanking interval's present is never given up. Measured in play, dropping it whenever the cursor was too close to it for both
-                // left the top of the screen alternating between frames 1.75 ms apart, refresh to refresh. A cursor low on the screen has its tear
-                // line pulled up far enough for a whole frame to fit before the blanking interval's, and one high on the screen, which that tear
-                // line is only just above anyway, has its draw held on the blanking interval's present instead of a present of its own.
-                double gapLines = (double)(betweenPresents.Percentile(costPercentile) + cost + lateNs) * timing.VTotal / timing.PeriodNs;
-
-                var placed = placeCursorTearline(cursorTop);
-
-                // The pen keeps moving between planning the present and its tear line being scanned out, by up to a couple of milliseconds of travel.
-                // Placed where the pen is predicted to be as the top of the cursor is scanned out, a fast upward movement doesn't carry the cursor into its own tear line.
-                if (cursor_tearline_predicts)
-                {
-                    var scanout = new PointerLatch.Scanout(placed.Target - (long)(offset * timing.PeriodNs / timing.VTotal), timing.VBlankNs, timing.PeriodNs, timing.VDisplay, timing.VTotal);
-
-                    if (latch.TryGetCursorTopAt(scanout.RowScannedAt(cursorTop), out float predictedTop))
-                    {
-#if RASTER_METRICS
-                        double moved = Math.Abs(predictedTop - cursorTop);
-
-                        intervalTopPredictions++;
-                        intervalTopPredictionLines += moved;
-                        intervalMaxTopPrediction = Math.Max(intervalMaxTopPrediction, moved);
-#endif
-                        placed = placeCursorTearline(predictedTop);
-                    }
-                }
-
-                merged = placed.Merged;
-                plannedCursorLine = placed.Line;
-
-                // The cursor's tear line has been placed to leave time for a whole frame either side of the blanking interval's, so whichever comes first goes first.
-                if (merged || placed.Target < target)
-                {
-                    target = placed.Target;
-                    cost += lateNs;
-                    forCursor = true;
-                }
-
-                (double Line, bool Merged, long Target) placeCursorTearline(float top)
-                {
-                    double line = top - cursor_tearline_lead;
-
-                    if (cursor_tearline_bands > 0)
-                    {
-                        double band = (double)timing.VTotal / cursor_tearline_bands;
-
-                        line = blankingLine + Math.Floor((line - blankingLine) / band) * band;
-                    }
-
-                    line = Math.Min(line, blankingLine - gapLines);
-
-                    if (line < blankingLine - timing.VTotal + gapLines)
-                    {
-                        long blankingTarget = anchor + ceilingDivide(now + cost + lateNs - anchor, slice) * slice;
-
-                        if (blankingTarget - lastGridTarget < slice / 2 || blankingTarget <= lastTarget)
-                            blankingTarget += slice;
-
-                        return (blankingLine - timing.VTotal, true, blankingTarget);
-                    }
-
-                    long cursorBase = timing.VBlankNs + (long)((line + offset) * timing.PeriodNs / timing.VTotal);
-                    long cursorTarget = cursorBase + ceilingDivide(now + cost + lateNs - cursorBase, timing.PeriodNs) * timing.PeriodNs;
-
-                    // Once a refresh.
-                    if (cursorTarget - lastCursorTarget < timing.PeriodNs / 2)
-                        cursorTarget += timing.PeriodNs;
-
-                    return (line, false, cursorTarget);
-                }
-            }
+            long anchor = plan.Anchor;
 
             // Slices left without a frame of their own since the last present. A slice given up to hold a collection, or crowded out by
             // the cursor's present, is counted apart from those, since skipped slices are how uneven pacing shows and these were chosen.
@@ -738,7 +779,30 @@ namespace osu.Desktop.Raster
             if (UpdateSync.MODE != UpdateSync.SyncMode.Off)
                 UpdateSync.NotePlan(plannedWake, slice);
 
-            sceneTiming.NotePlan(plannedWake, target - (long)(offset * timing.PeriodNs / timing.VTotal));
+            if (SceneTiming.ENABLED)
+            {
+                // The present after this one, as if this one lands on time and nothing moves but time and the pen. Update frames that run once this
+                // present's draw has started are shown by that one, which isn't planned until this one has been swapped.
+                long nextPlanned = Math.Max(target, now) + betweenPresents.Percentile(0.5);
+                var next = choosePresent(timing, nextPlanned, renderNs, count, offset,
+                    target, !forCursor || merged ? target : lastGridTarget, forCursor ? target : lastCursorTarget, false);
+
+                sceneTiming.NotePlan(plannedWake, target - offsetNs, next.Target - next.Cost, next.Target - offsetNs);
+
+#if RASTER_METRICS
+                if (foreseenTear != 0 && followsPresent)
+                {
+                    long error = Math.Abs(target - offsetNs - foreseenTear);
+
+                    foresightErrors.Add(error);
+
+                    if (error >= timing.PeriodNs / 2)
+                        intervalForesightMisses++;
+                }
+
+                foreseenTear = next.Target - offsetNs;
+#endif
+            }
 
 #if RASTER_METRICS
             // A collection that runs while the draw thread sleeps costs it nothing: the thread is inside a blocking
@@ -1155,7 +1219,12 @@ namespace osu.Desktop.Raster
                            + $"{gcPacer.TakeForced()} were held for a gap before a frame, giving up {intervalCollectionSkips} slices to make one, "
                            + $"which costs a present {ms(gcPacer.ExpectedPauseNs)} ms against a {gcPacer.BudgetBytes / 1024} KiB budget.");
 
-                Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart));
+                Logger.Log(UpdateSync.TakeIntervalSummary(end - intervalStart)
+                           + (SceneTiming.ENABLED
+                               ? $" Each present tore {ms(foresightErrors.Percentile(0.5))}/{ms(foresightErrors.Percentile(0.99))} ms at p50/p99 from where it was foreseen, {intervalForesightMisses} of them half a refresh or more."
+                               : string.Empty));
+
+                intervalForesightMisses = 0;
                 Logger.Log(pacing.TakeIntervalSummary());
 
                 if (host.PointerLatch != null)

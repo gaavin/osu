@@ -118,6 +118,8 @@ namespace osu.Desktop.Raster
         {
             base.UpdateFrame();
 
+            RasterSync.NoteUpdateFrameEnd();
+
 #if !RASTER_METRICS
             if (UpdateSync.MODE == UpdateSync.SyncMode.Off)
                 return;
