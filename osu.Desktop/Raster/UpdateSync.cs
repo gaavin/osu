@@ -111,6 +111,10 @@ namespace osu.Desktop.Raster
         // How old the gameplay clock the drawn scene was sampled at was at present, before and after it was timed by its present.
         private readonly DurationWindow sampledAgesAtPresent = new DurationWindow(history);
         private readonly DurationWindow timedAgesAtPresent = new DurationWindow(history);
+
+        // The same against the time the present was planned for, which leaves out presents that finished late, since no timing of the clock can foresee those.
+        private readonly DurationWindow sampledAgesAtTarget = new DurationWindow(history);
+        private readonly DurationWindow timedAgesAtTarget = new DurationWindow(history);
         private long drawnSceneTime;
         private long drawnSceneLead;
         private readonly DurationWindow idleBeforeDraw = new DurationWindow(history);
@@ -300,7 +304,7 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// Draw thread, when a drawn frame's present starts.
         /// </summary>
-        public void NotePresent(long presentStart)
+        public void NotePresent(long presentStart, long target)
         {
             if (!drawnFrameKnown)
                 return;
@@ -313,6 +317,8 @@ namespace osu.Desktop.Raster
             {
                 sampledAgesAtPresent.Add(Math.Max(0, presentStart - drawnSceneTime));
                 timedAgesAtPresent.Add(Math.Max(0, presentStart - drawnSceneTime - drawnSceneLead));
+                sampledAgesAtTarget.Add(Math.Max(0, target - drawnSceneTime));
+                timedAgesAtTarget.Add(Math.Max(0, target - drawnSceneTime - drawnSceneLead));
             }
             intervalMaxAgeAtPresent = Math.Max(intervalMaxAgeAtPresent, age);
         }
@@ -337,6 +343,8 @@ namespace osu.Desktop.Raster
                              + $"Timed update frames aim to finish {ms(Volatile.Read(ref estimateNs))} ms after starting. "
                              + $"Gameplay clock age at present, p1/p50/p99: sampled {ms(sampledAgesAtPresent.Percentile(0.01))}/{ms(sampledAgesAtPresent.Percentile(0.5))}/{ms(sampledAgesAtPresent.Percentile(0.99))}, "
                              + $"as timed {ms(timedAgesAtPresent.Percentile(0.01))}/{ms(timedAgesAtPresent.Percentile(0.5))}/{ms(timedAgesAtPresent.Percentile(0.99))}"
+                             + $"; against the planned target, sampled {ms(sampledAgesAtTarget.Percentile(0.01))}/{ms(sampledAgesAtTarget.Percentile(0.5))}/{ms(sampledAgesAtTarget.Percentile(0.99))}, "
+                             + $"as timed {ms(timedAgesAtTarget.Percentile(0.01))}/{ms(timedAgesAtTarget.Percentile(0.5))}/{ms(timedAgesAtTarget.Percentile(0.99))}"
                              + (SceneTiming.ENABLED ? " (timed by each present's tear line)." : " (scene timing off).");
 
             intervalStartFrame = published;

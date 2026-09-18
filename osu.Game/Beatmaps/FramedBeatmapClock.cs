@@ -31,7 +31,7 @@ namespace osu.Game.Beatmaps
 
         private readonly OffsetCorrectionClock? userGlobalOffsetClock;
         private readonly OffsetCorrectionClock? platformOffsetClock;
-        private readonly OffsetCorrectionClock? sceneTimingClock;
+        private readonly ScanoutTimedClock? sceneTimingClock;
         private readonly FramedOffsetClock? userBeatmapOffsetClock;
 
         private readonly IFrameBasedClock finalClockSource;
@@ -94,7 +94,7 @@ namespace osu.Game.Beatmaps
             if (applyOffsets)
             {
                 // Runs the clock at the time the present showing each update frame is scanned out, where the host times presents against the display.
-                sceneTimingClock = new OffsetCorrectionClock(interpolatedTrack);
+                sceneTimingClock = new ScanoutTimedClock(interpolatedTrack);
 
                 platformOffsetClock = new OffsetCorrectionClock(sceneTimingClock);
 
@@ -180,7 +180,7 @@ namespace osu.Game.Beatmaps
             base.Update();
 
             if (TimedByScanout && IsRunning && sceneTimingClock != null && rasterSync != null)
-                sceneTimingClock.Offset = rasterSync.TakeSceneLeadMilliseconds();
+                sceneTimingClock.Lead = rasterSync.TakeSceneLeadMilliseconds();
 
             finalClockSource.ProcessFrame();
 
