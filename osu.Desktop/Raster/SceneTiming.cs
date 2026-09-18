@@ -38,6 +38,21 @@ namespace osu.Desktop.Raster
         public static readonly bool CENTRE_ON_DRAWN = Environment.GetEnvironmentVariable(@"OSU_RASTER_SCENE_CENTRE") != @"all";
 
         /// <summary>
+        /// While this file exists the gameplay clock runs untimed, so the timing can be switched mid-session for a blind comparison: <c>$XDG_RUNTIME_DIR/osu-scene-timing-off</c>.
+        /// </summary>
+        private static readonly string? switch_path = Environment.GetEnvironmentVariable(@"XDG_RUNTIME_DIR") is string runtimeDir ? System.IO.Path.Combine(runtimeDir, @"osu-scene-timing-off") : null;
+
+        private const long switch_check_ns = 500_000_000;
+
+        private long switchCheckedAt;
+        private volatile bool switchedOff;
+
+        /// <summary>
+        /// Whether the live switch has the timing off. Read for the log.
+        /// </summary>
+        public bool SwitchedOff => switchedOff;
+
+        /// <summary>
         /// A plan older than this is from before pacing stopped.
         /// </summary>
         private const long stale_plan_ns = 50_000_000;
@@ -137,7 +152,13 @@ namespace osu.Desktop.Raster
             long lead = 0;
             long raw = 0;
 
-            if (wake != 0 && now - wake < stale_plan_ns)
+            if (switch_path != null && now - switchCheckedAt > switch_check_ns)
+            {
+                switchCheckedAt = now;
+                switchedOff = System.IO.File.Exists(switch_path);
+            }
+
+            if (!switchedOff && wake != 0 && now - wake < stale_plan_ns)
             {
                 // A draw shows the newest scene published before it wakes.
                 bool planned = now + (long)publishDelayNs < wake;
@@ -204,7 +225,8 @@ namespace osu.Desktop.Raster
         {
             long frame = Volatile.Read(ref published);
 
-            if (frame == 0)
+            // Untimed frames would pull the centre towards no shift, leaving the first seconds after switching back on off centre.
+            if (frame == 0 || switchedOff)
                 return;
 
             long sampled = slotSampledAt[frame & (slot_count - 1)];
@@ -266,7 +288,7 @@ namespace osu.Desktop.Raster
         public string Summary() =>
             $" Scene steps against tear line steps, ms off at p50/p90/p99: sampled {ms(sampledSteps.Percentile(0.5))}/{ms(sampledSteps.Percentile(0.9))}/{ms(sampledSteps.Percentile(0.99))}, "
             + $"timed {ms(timedSteps.Percentile(0.5))}/{ms(timedSteps.Percentile(0.9))}/{ms(timedSteps.Percentile(0.99))}. "
-            + $"Held {ms(Volatile.Read(ref holdNs))} ms before each wake, centred on {(CENTRE_ON_DRAWN ? "drawn frames" : "every update frame")}, "
+            + $"Live switch {(switchedOff ? "OFF" : "on")}. Held {ms(Volatile.Read(ref holdNs))} ms before each wake, centred on {(CENTRE_ON_DRAWN ? "drawn frames" : "every update frame")}, "
             + $"running the clock {(meanRawNs - (CENTRE_ON_DRAWN ? Volatile.Read(ref centreNs) : meanRawNs)) / 1e6:+0.000;-0.000} ms ahead on average, which is how far judgements move.";
 
         private static string ms(long ns) => $"{ns / 1e6:0.000}";
