@@ -16,7 +16,7 @@ namespace osu.Desktop.Raster
     ///
     /// The clock runs at real time, shifted by the render margin of the present that will show the update frame, and holds still for a short window
     /// before that present's draw wakes. The frame the draw picks up is almost always sampled inside that window, so its clock reads exactly the
-    /// present's tear time less a constant, whatever point of the update frame the draw caught. The window is the 90th percentile of how long before the
+    /// present's tear time less a constant, whatever point of the update frame the draw caught. The window is the 99th percentile of how long before the
     /// wake drawn frames were sampled. Update frames that run once a draw has woken belong to the next present, which the draw thread foresees as it plans.
     ///
     /// The constant is steered so drawn scenes are on average exactly as old as without the timing. A first version averaged the shift over every update
@@ -65,7 +65,12 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// The share of drawn frames the hold before each wake is sized to cover.
         /// </summary>
-        private const double hold_percentile = 0.9;
+        /// <remarks>
+        /// A step between two presents only comes out exact when both drawn frames were sampled inside the hold, so a hold covering 90% of them left
+        /// about a fifth of steps untimed: measured in play, the median step error went from 0.110 to 0.010 ms but the 90th percentile only from 0.270 to 0.250.
+        /// A longer hold stills the clock for longer before each draw, which moves judgements a little further on average.
+        /// </remarks>
+        private const double hold_percentile = 0.99;
 
         /// <summary>
         /// Draws between resizing the hold.
