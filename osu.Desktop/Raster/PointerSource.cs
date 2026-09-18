@@ -28,18 +28,47 @@ namespace osu.Desktop.Raster
         private const float match_distance_squared = 0.25f;
 
         /// <summary>
+        /// How far back a report may be to measure the pointer's velocity from, when predicting past the newest one.
+        /// A baseline of a couple of reports keeps a pair that arrived together, or a repeated position, from swinging the prediction.
+        /// </summary>
+        private const long velocity_baseline_ns = 2_000_000;
+
+        /// <summary>
+        /// Reports further apart than this mean the pointer stopped reporting, as a pen lifted out of range does, and nothing is predicted across the gap.
+        /// </summary>
+        private const long stale_gap_ns = 8_000_000;
+
+        /// <summary>
+        /// The furthest past the newest report the pointer is predicted.
+        /// </summary>
+        private const long max_prediction_ns = 3_000_000;
+
+        /// <summary>
+        /// Reports read back at most, leaving slots the device's thread can write while the draw thread reads without catching up with it.
+        /// </summary>
+        private const int readable = history - 4;
+
+        /// <summary>
         /// What the device is called in the log.
         /// </summary>
         public readonly string Name;
 
+        /// <summary>
+        /// Whether the device's reports arrive when it sends them, so the time each arrives says where the pointer was when.
+        /// A mouse's are handed over as the window thread polls, bunched, and are drawn at the newest instead.
+        /// </summary>
+        public readonly bool Timed;
+
         // Written on the device's thread, read on the update and draw threads. A position packs into one long so it is read whole.
         private readonly long[] reports = new long[history];
+        private readonly long[] reportTimes = new long[history];
         private int nextReport;
         private long latest;
 
-        protected PointerSource(string name)
+        protected PointerSource(string name, bool timed)
         {
             Name = name;
+            Timed = timed;
         }
 
         /// <summary>
@@ -48,19 +77,19 @@ namespace osu.Desktop.Raster
         protected void Report(float x, float y)
         {
             long packed = pack(x, y);
+            long now = Native.MonotonicNs();
 
             reports[nextReport & (history - 1)] = packed;
+            reportTimes[nextReport & (history - 1)] = now;
             Volatile.Write(ref nextReport, nextReport + 1);
             Volatile.Write(ref latest, packed);
 
 #if RASTER_METRICS
-            long now = Native.MonotonicNs();
 
             if (lastReportAt > 0)
                 reportIntervals.Add(now - lastReportAt);
 
             lastReportAt = now;
-            Volatile.Write(ref latestAt, now);
             Interlocked.Increment(ref intervalReports);
 #endif
         }
@@ -86,10 +115,105 @@ namespace osu.Desktop.Raster
         /// </summary>
         public Vector2 Latest => unpack(Volatile.Read(ref latest));
 
+        /// <summary>
+        /// Where the pointer was at a time, between the reports either side of it, or predicted from the last few past the newest. Draw thread.
+        /// Returns false if the reports do not say, as for a device that is not <see cref="Timed"/>, and gives the newest report instead.
+        /// </summary>
+        /// <remarks>
+        /// The display scans out on its own clock and the device reports on another, so the newest report is anywhere from nothing to a whole
+        /// report interval old when the cursor is scanned out, and that changes from one refresh to the next. At speed that is a cursor which wobbles
+        /// along its path by however far the pointer moves in one interval. Sampling the path at a fixed time before scanout keeps it the same age every refresh.
+        /// </remarks>
+        public bool TryGetPositionAt(long time, out Vector2 position, out long newestAt)
+        {
+            int written = Volatile.Read(ref nextReport);
+
+            position = Latest;
+            newestAt = 0;
+
+            if (!Timed || written < 2)
+                return false;
+
+            int count = Math.Min(written, readable);
+            int newestSlot = (written - 1) & (history - 1);
+
+            newestAt = reportTimes[newestSlot];
+            Vector2 newest = unpack(reports[newestSlot]);
+
+            if (time >= newestAt)
+            {
+                // Past the newest report: carried on at the velocity over the last couple of reports, unless the device has gone quiet.
+                if (time - newestAt > stale_gap_ns)
+                    count = 1;
+
+                long horizon = Math.Min(time - newestAt, max_prediction_ns);
+                int baseline = -1;
+
+                for (int i = 1; i < count; i++)
+                {
+                    int slot = (written - 1 - i) & (history - 1);
+                    long gap = newestAt - reportTimes[slot];
+
+                    if (gap > stale_gap_ns)
+                        break;
+
+                    baseline = slot;
+
+                    if (gap >= velocity_baseline_ns)
+                        break;
+                }
+
+                position = newest;
+
+                if (baseline >= 0 && reportTimes[baseline] < newestAt)
+                {
+                    Vector2 velocity = (newest - unpack(reports[baseline])) / (newestAt - reportTimes[baseline]);
+
+                    position = newest + velocity * horizon;
+                }
+            }
+            else
+            {
+                // Between two reports: where the pointer was on the straight line joining them.
+                position = newest;
+
+                long laterAt = newestAt;
+                Vector2 later = newest;
+
+                for (int i = 1; i < count; i++)
+                {
+                    int slot = (written - 1 - i) & (history - 1);
+                    long earlierAt = reportTimes[slot];
+                    Vector2 earlier = unpack(reports[slot]);
+
+                    position = earlier;
+
+                    if (earlierAt <= time)
+                    {
+                        if (laterAt > earlierAt && laterAt - earlierAt <= stale_gap_ns)
+                            position = Vector2.Lerp(earlier, later, (float)(time - earlierAt) / (laterAt - earlierAt));
+
+                        break;
+                    }
+
+                    laterAt = earlierAt;
+                    later = earlier;
+                }
+            }
+
+            // The device's thread writing over what was just read means it was read mid-write, and the newest report is safer.
+            if (Volatile.Read(ref nextReport) - written >= history - readable)
+            {
+                position = Latest;
+                return false;
+            }
+
+            return true;
+        }
+
 #if RASTER_METRICS
         private const int metric_history = 1024;
 
-        private long latestAt;
         private long lastReportAt;
         private int intervalReports;
         private readonly DurationWindow reportIntervals = new DurationWindow(metric_history);
@@ -97,7 +221,7 @@ namespace osu.Desktop.Raster
         /// <summary>
         /// When the device last reported. Draw thread.
         /// </summary>
-        public long LatestAt => Volatile.Read(ref latestAt);
+        public long LatestAt => reportTimes[(Volatile.Read(ref nextReport) - 1) & (history - 1)];
 
         /// <summary>
         /// The device's part of a log line for the interval just ended, which starts the next. Draw thread.
